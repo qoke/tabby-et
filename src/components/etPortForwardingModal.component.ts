@@ -5,7 +5,7 @@ import { ETSession } from '../session/etSession'
 
 /** @hidden */
 @Component({
-    templateUrl: './etPortForwardingModal.component.pug',
+    template: require('./etPortForwardingModal.component.pug'),
 })
 export class ETPortForwardingModalComponent {
     @Input() session: ETSession

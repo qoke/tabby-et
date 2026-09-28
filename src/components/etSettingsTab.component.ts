@@ -3,7 +3,7 @@ import { ConfigService } from 'tabby-core'
 
 /** @hidden */
 @Component({
-    templateUrl: './etSettingsTab.component.pug',
+    template: require('./etSettingsTab.component.pug'),
 })
 export class ETSettingsTabComponent {
     @HostBinding('class.content-box') true

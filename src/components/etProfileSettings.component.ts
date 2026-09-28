@@ -11,7 +11,7 @@ import { ETProfilesService } from '../profiles'
 
 /** @hidden */
 @Component({
-    templateUrl: './etProfileSettings.component.pug',
+    template: require('./etProfileSettings.component.pug'),
 })
 export class ETProfileSettingsComponent implements ProfileSettingsComponent<ETProfile, ETProfilesService> {
     Platform = Platform

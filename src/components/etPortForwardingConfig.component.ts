@@ -6,7 +6,7 @@ import { isLoopbackBindAddress, parseTunnelSpec } from '../session/tunnelSpec'
 /** @hidden */
 @Component({
     selector: 'et-port-forwarding-config',
-    templateUrl: './etPortForwardingConfig.component.pug',
+    template: require('./etPortForwardingConfig.component.pug'),
 })
 export class ETPortForwardingConfigComponent {
     @Input() model: ForwardedPortConfig[]

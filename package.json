@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "webpack --config webpack.config.mjs",
+    "check:bundle": "node scripts/check-bundle.mjs",
     "watch": "webpack --config webpack.config.mjs --watch",
     "prepack": "npm run build"
   },
