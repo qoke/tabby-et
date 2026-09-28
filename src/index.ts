@@ -5,10 +5,11 @@ import { NgbModule } from '@ng-bootstrap/ng-bootstrap'
 import { ToastrModule } from 'ngx-toastr'
 import TabbyCoreModule, { ConfigProvider, HotkeyProvider, ProfileProvider, TabRecoveryProvider } from 'tabby-core'
 import { SettingsTabProvider } from 'tabby-settings'
-import TabbyTerminalModule from 'tabby-terminal'
+import TabbyTerminalModule, { TerminalDecorator } from 'tabby-terminal'
 import TabbySSHModule from 'tabby-ssh'
 
 import { ETTabComponent } from './components/etTab.component'
+import { GPUMemoryGuardDecorator } from './gpu/gpuGuardDecorator'
 import { ETProfileSettingsComponent } from './components/etProfileSettings.component'
 import { ETPortForwardingConfigComponent } from './components/etPortForwardingConfig.component'
 import { ETPortForwardingModalComponent } from './components/etPortForwardingModal.component'
@@ -39,6 +40,7 @@ import { RecoveryProvider } from './recoveryProvider'
         { provide: TabRecoveryProvider, useClass: RecoveryProvider, multi: true },
         { provide: SettingsTabProvider, useClass: ETSettingsTabProvider, multi: true },
         { provide: ProfileProvider, useExisting: ETProfilesService, multi: true },
+        { provide: TerminalDecorator, useClass: GPUMemoryGuardDecorator, multi: true },
     ],
     declarations: [
         ETTabComponent,

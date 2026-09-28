@@ -28,4 +28,13 @@ h3 Eternal Terminal
         (ngModelChange)='config.save()',
     )
 
+.form-line
+    .header
+        .title(translate) Release GPU memory of hidden terminal tabs
+        .description(translate) Drops the WebGL renderer of tabs hidden for 30 seconds, keeps the glyph atlas under 48 MB and caps inline images at 32 MB per terminal. Applies to every terminal tab. Limits are adjustable under et.gpuMemoryGuard in the config file.
+    toggle(
+        [(ngModel)]='config.store.et.gpuMemoryGuard.enabled',
+        (ngModelChange)='config.save()',
+    )
+
 .alert.alert-info(translate) Eternal Terminal sessions are not resumed across a Tabby restart. Closing and reopening a tab starts a brand-new remote session; the previous one keeps running until its shell exits.

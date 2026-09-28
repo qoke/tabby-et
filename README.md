@@ -45,6 +45,41 @@ This loads the copied plugin package into the preview build without publishing i
 
 Once the upstream SSH changes are released and this plugin is published on npm, it can be installed through Tabby's Plugin Manager by searching for `tabby-et`. The npm package is not published yet.
 
+## GPU memory guard
+
+Stock Tabby keeps a full-size WebGL canvas alive for every hidden terminal tab
+(a regression from upstream PR #11354, June 2026), never bounds the xterm.js
+glyph atlas that every terminal's GPU context mirrors, never explicitly loses a
+WebGL context when a tab closes, and lets the sixel image store grow to 128 MB
+per terminal. GPU memory therefore climbs with every tab and every new
+glyph/colour combination and rarely comes back down. Eternal Terminal tabs live
+for days, so they show it most.
+
+This plugin ships a guard that applies to every terminal tab:
+
+- a tab hidden for 30 seconds releases its WebGL renderer and gets it back when
+  shown again, without touching the host's context-loss recovery budget
+- the shared glyph atlas is cleared once its pages exceed 48 MB
+- the WebGL context is lost explicitly when a tab is closed instead of waiting
+  for garbage collection
+- the inline image store is capped at 32 MB per terminal
+
+It can be switched off in Settings > Eternal Terminal. The limits live in the
+config file:
+
+```yaml
+et:
+  gpuMemoryGuard:
+    enabled: true
+    hiddenReleaseDelaySeconds: 30
+    atlasBudgetMB: 48
+    imageStorageLimitMB: 32
+```
+
+Two host-side issues are out of a plugin's reach: the WebGL probe that Tabby
+runs for every new tab (cached and released by upstream since #11673) and the
+`max-active-webgl-contexts=9000` Chromium flag that disables context eviction.
+
 ## Development
 
 `npm run watch` rebuilds the bundle after source changes. `npm pack --dry-run` shows the package contents. The bundle leaves Tabby and Angular modules external so the running application supplies its own instances. Other libraries used by ET are bundled with the plugin.
