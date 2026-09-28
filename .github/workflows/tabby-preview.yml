@@ -40,8 +40,36 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  tabby-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out Tabby with SSH support
+        uses: actions/checkout@v4
+        with:
+          repository: qoke/tabby
+          ref: ${{ inputs.tabby_ref || 'tabby-et-ssh-support' }}
+          fetch-depth: 0
+      - name: Fetch upstream release tags
+        run: git fetch --force --tags https://github.com/Eugeny/tabby.git
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Tabby dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libsecret-1-dev
+          npm i -g yarn
+          cd app
+          yarn
+          cd ..
+          rm app/node_modules/.yarn-integrity
+          yarn
+      - name: Build Tabby typings
+        run: yarn run build:typings
+      - name: Run Tabby's PR lint gate
+        run: yarn run lint
+
   macos:
-    needs: plugin
+    needs: [plugin, tabby-lint]
     runs-on: macos-15
     strategy:
       fail-fast: false

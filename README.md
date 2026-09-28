@@ -24,7 +24,7 @@ TABBY_PLUGINS="$PWD" /path/to/patched/tabby --debug
 
 ## Download a patched macOS Tabby build
 
-The [Patched Tabby preview workflow](https://github.com/qoke/tabby-et/actions/workflows/tabby-preview.yml) checks out `qoke/tabby` at `tabby-et-ssh-support`, runs Tabby's normal macOS build and packaging commands, and builds this plugin. Run it manually to select another branch or commit. Each successful run offers three downloadable artifacts for 30 days:
+The [Patched Tabby preview workflow](https://github.com/qoke/tabby-et/actions/workflows/tabby-preview.yml) checks out `qoke/tabby` at `tabby-et-ssh-support`, runs the same typings and lint commands as Tabby's PR workflow, runs Tabby's normal macOS build and packaging commands, and builds this plugin. Run it manually to select another branch or commit. Each successful run offers three downloadable artifacts for 30 days:
 
 - `tabby-macos-arm64`: Apple Silicon DMG and ZIP.
 - `tabby-macos-x86_64`: Intel DMG and ZIP.
