@@ -47,3 +47,9 @@ jobs:
           else
             echo 'Gatekeeper rejected the ad-hoc preview, as expected without Developer ID signing'
           fi
+          xattr -w com.apple.quarantine '0081;00000000;GitHub Actions;preview' "$copy_dir/Tabby.app"
+          xattr -dr com.apple.quarantine "$copy_dir/Tabby.app"
+          codesign --verify --deep --strict --verbose=2 "$copy_dir/Tabby.app"
+          open -n "$copy_dir/Tabby.app"
+          sleep 5
+          ps -axo pid,command | grep '[T]abby.app/Contents/MacOS/Tabby'
