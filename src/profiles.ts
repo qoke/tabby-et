@@ -86,6 +86,9 @@ export class ETProfilesService extends QuickConnectProfileProvider<ETProfile> {
 
     intoQuickConnectString (profile: ETProfile): string|null {
         let s = profile.options.host
+        if (s.includes(':') && !s.startsWith('[')) {
+            s = `[${s}]`
+        }
         if (profile.options.user) {
             s = `${profile.options.user}@${s}`
         }

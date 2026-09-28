@@ -114,6 +114,8 @@ export class ETBootstrap {
         return new Promise((resolve, reject) => {
             let stdout = ''
             let stderr = ''
+            let stdoutBytes = 0
+            let stderrBytes = 0
             let settled = false
             let timer: any = null
 
@@ -140,9 +142,14 @@ export class ETBootstrap {
             void (async () => {
                 try {
                     const channel = await session.openExecChannel(command)
+                    if (settled) {
+                        return
+                    }
                     channel.data$.subscribe(data => {
-                        if (stdout.length < captureLimit) {
-                            stdout += Buffer.from(data).toString('utf8')
+                        if (stdoutBytes < captureLimit) {
+                            const chunk = Buffer.from(data).subarray(0, captureLimit - stdoutBytes)
+                            stdout += chunk.toString('utf8')
+                            stdoutBytes += chunk.length
                         }
                         // Resolve as soon as the marker appears - etterminal daemonises and
                         // the channel may stay open briefly afterwards.
@@ -151,8 +158,10 @@ export class ETBootstrap {
                         }
                     })
                     channel.extendedData$.subscribe(([, data]) => {
-                        if (stderr.length < captureLimit) {
-                            stderr += Buffer.from(data).toString('utf8')
+                        if (stderrBytes < captureLimit) {
+                            const chunk = Buffer.from(data).subarray(0, captureLimit - stderrBytes)
+                            stderr += chunk.toString('utf8')
+                            stderrBytes += chunk.length
                         }
                     })
                     channel.closed$.subscribe(() => finish())

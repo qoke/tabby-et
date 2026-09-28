@@ -19,8 +19,8 @@ export function isLoopbackBindAddress (host: string): boolean {
 }
 
 function parsePort (s: string): number {
-    const port = parseInt(s, 10)
-    if (isNaN(port) || port < 1 || port > 65535) {
+    const port = /^\d+$/.test(s) ? Number(s) : NaN
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
         throw new Error(`Invalid port "${s}"`)
     }
     return port
@@ -29,6 +29,9 @@ function parsePort (s: string): number {
 function parseRange (s: string): number[] {
     if (!s.includes('-')) {
         return [parsePort(s)]
+    }
+    if (!/^\d+-\d+$/.test(s)) {
+        throw new Error(`Invalid port range "${s}"`)
     }
     const [fromStr, toStr] = s.split('-')
     let from = NaN

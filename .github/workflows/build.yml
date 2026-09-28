@@ -16,4 +16,5 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run check:bundle
+      - run: npm test
       - run: npm pack --dry-run --ignore-scripts

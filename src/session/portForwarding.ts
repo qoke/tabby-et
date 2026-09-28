@@ -29,6 +29,8 @@ type Role = 'source'|'destination'
  * declared reverse tunnel.
  */
 const MAX_CONCURRENT_DESTINATION_SOCKETS = 256
+const MAX_PENDING_SOURCE_SOCKETS = 256
+const DESTINATION_RESPONSE_TIMEOUT = 30000
 
 /**
  * How much data may sit queued for one local socket before we give up on it.
@@ -96,7 +98,7 @@ function resolveAgentPath (): string|null {
 
 export class ETPortForwardHandler {
     /** Sockets we accepted locally, awaiting a socketId from the peer. Keyed by our token. */
-    private unassigned = new Map<number, { socket: Socket, config: ForwardedPortConfig }>()
+    private unassigned = new Map<number, { socket: Socket, config: ForwardedPortConfig, timer: ReturnType<typeof setTimeout> }>()
     /** socketId -> local socket, for tunnels where WE are the source. */
     private sourceSockets = new Map<number, Socket>()
     /** Which declared forward each source socket belongs to (for live removal). */
@@ -119,6 +121,8 @@ export class ETPortForwardHandler {
     readonly activeForwards: ForwardedPortConfig[] = []
     /** Destination sockets that are connecting but not yet in destinationSockets. */
     private pendingDestinations = 0
+    private pendingDestinationSockets = new Set<Socket>()
+    private disposed = false
     private nextToken = 1
     private nextSocketId = 1
 
@@ -142,11 +146,20 @@ export class ETPortForwardHandler {
 
     addLocalForward (config: ForwardedPortConfig): Promise<void> {
         return new Promise((resolve, reject) => {
+            if (this.disposed) {
+                reject(new Error('Session has ended'))
+                return
+            }
             const server = createServer(socket => this.onLocalConnection(config, socket))
             const onListenError = (err: Error) => reject(err)
             server.once('error', onListenError)
             server.listen(config.port, config.host, () => {
                 server.removeListener('error', onListenError)
+                if (this.disposed) {
+                    server.close()
+                    reject(new Error('Session has ended'))
+                    return
+                }
                 // A net.Server with no 'error' listener THROWS on any later error
                 // (EMFILE while accepting, for one), which would take the whole
                 // renderer down. Keep one attached for the listener's lifetime,
@@ -183,6 +196,7 @@ export class ETPortForwardHandler {
             }
             for (const [token, entry] of this.unassigned) {
                 if (entry.config === config) {
+                    clearTimeout(entry.timer)
                     entry.socket.destroy()
                     this.unassigned.delete(token)
                 }
@@ -252,22 +266,45 @@ export class ETPortForwardHandler {
     // ---- we are the SOURCE ------------------------------------------------
 
     private onLocalConnection (config: ForwardedPortConfig, socket: Socket): void {
+        if (this.disposed) {
+            socket.destroy()
+            return
+        }
+        if (this.unassigned.size >= MAX_PENDING_SOURCE_SOCKETS) {
+            socket.destroy()
+            this.logger.warn('Refused a forwarded connection: too many pending destination responses')
+            return
+        }
         const token = this.nextToken++
         // Pause until the peer assigns a socketId, otherwise early bytes are lost.
         socket.pause()
-        this.unassigned.set(token, { socket, config })
-
-        socket.once('error', () => {
+        const timer = setTimeout(() => {
             this.unassigned.delete(token)
             socket.destroy()
+            this.emitServiceMessage('Timed out opening a forwarded connection')
+        }, DESTINATION_RESPONSE_TIMEOUT)
+        this.unassigned.set(token, { socket, config, timer })
+
+        socket.once('error', () => {
+            socket.destroy()
+        })
+        socket.once('close', () => {
+            clearTimeout(timer)
+            this.unassigned.delete(token)
         })
 
-        this.send(ETPacketType.PORT_FORWARD_DESTINATION_REQUEST, encodePortForwardDestinationRequest({
+        const sent = this.send(ETPacketType.PORT_FORWARD_DESTINATION_REQUEST, encodePortForwardDestinationRequest({
             // ET ignores the destination name for TCP and connects to the remote
             // localhost, but we send it anyway for forward compatibility.
             destination: { name: config.targetAddress, port: config.targetPort },
             fd: token,
         }))
+        if (!sent) {
+            this.unassigned.delete(token)
+            clearTimeout(timer)
+            socket.destroy()
+            this.emitServiceMessage('Dropped a forwarded connection: the ET write buffer is full')
+        }
     }
 
     private onDestinationResponse (payload: Buffer): void {
@@ -278,8 +315,17 @@ export class ETPortForwardHandler {
 
         if (!entry) {
             this.logger.warn(`Destination response for an unknown token ${token}`)
+            // The local client may have timed out or closed while the peer was
+            // connecting. Release the peer's new socket if its id is not already
+            // in use by another live source connection.
+            if (!response.hasError && response.socketId !== undefined && !this.sourceSockets.has(response.socketId)) {
+                this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
+                    sourceToDestination: true, socketId: response.socketId, closed: true,
+                }))
+            }
             return
         }
+        clearTimeout(entry.timer)
         if (response.hasError) {
             this.emitServiceMessage(`Remote refused a forwarded connection: ${response.error}`)
             entry.socket.destroy()
@@ -346,6 +392,10 @@ export class ETPortForwardHandler {
                 return
             }
             settled = true
+            if (this.disposed) {
+                socket.destroy()
+                return
+            }
             this.pendingDestinations--
             this.onDestinationConnected(socket, request.fd)
         }
@@ -354,6 +404,9 @@ export class ETPortForwardHandler {
                 return
             }
             settled = true
+            if (this.disposed) {
+                return
+            }
             this.pendingDestinations--
             this.sendDestinationError(request.fd, err)
         }
@@ -366,29 +419,41 @@ export class ETPortForwardHandler {
         } else {
             // Unix socket path, or a Windows named pipe for agent forwarding.
             const socket = new Socket()
+            this.pendingDestinationSockets.add(socket)
             socket.setNoDelay(true)
             const onConnectError = (err: Error) => {
+                this.pendingDestinationSockets.delete(socket)
                 socket.destroy()
                 failed(err)
             }
             socket.once('error', onConnectError)
-            socket.connect(resolved.path, () => {
-                // Hand the socket over cleanly: pipeSocket installs its own error
-                // handling, and leaving this one attached would answer a mid-stream
-                // error with a second DESTINATION_RESPONSE for the same fd.
-                socket.removeListener('error', onConnectError)
-                connected(socket)
-            })
+            try {
+                socket.connect(resolved.path, () => {
+                    this.pendingDestinationSockets.delete(socket)
+                    // Hand the socket over cleanly: pipeSocket installs its own error
+                    // handling, and leaving this one attached would answer a mid-stream
+                    // error with a second DESTINATION_RESPONSE for the same fd.
+                    socket.removeListener('error', onConnectError)
+                    connected(socket)
+                })
+            } catch (err) {
+                this.pendingDestinationSockets.delete(socket)
+                socket.destroy()
+                failed(err as Error)
+            }
         }
     }
 
     private onDestinationConnected (socket: Socket, fd: number): void {
         const socketId = this.nextSocketId++
-        this.destinationSockets.set(socketId, socket)
-        this.send(
+        if (!this.send(
             ETPacketType.PORT_FORWARD_DESTINATION_RESPONSE,
             encodePortForwardDestinationResponse({ clientFd: fd, socketId, hasError: false }),
-        )
+        )) {
+            socket.destroy()
+            return
+        }
+        this.destinationSockets.set(socketId, socket)
         this.pipeSocket(socket, socketId, 'destination')
     }
 
@@ -404,10 +469,12 @@ export class ETPortForwardHandler {
         const hosts = ['::1', '127.0.0.1']
         const attempt = (index: number): void => {
             const socket = new Socket()
+            this.pendingDestinationSockets.add(socket)
             socket.setNoDelay(true)
             const fail = (err: Error) => {
+                this.pendingDestinationSockets.delete(socket)
                 socket.destroy()
-                if (index + 1 < hosts.length) {
+                if (!this.disposed && index + 1 < hosts.length) {
                     attempt(index + 1)
                 } else {
                     onError(err)
@@ -415,6 +482,7 @@ export class ETPortForwardHandler {
             }
             socket.once('error', fail)
             socket.connect(port, hosts[index], () => {
+                this.pendingDestinationSockets.delete(socket)
                 socket.removeListener('error', fail)
                 onConnect(socket)
             })
@@ -515,6 +583,9 @@ export class ETPortForwardHandler {
     }
 
     handlePacket (header: number, payload: Buffer): void {
+        if (this.disposed) {
+            return
+        }
         // A malformed packet must never throw out of here: ETSession treats a
         // throw as a socket failure and would churn the connection. Drop it and
         // carry on; a genuine crypto desync still fails inside BackedReader.
@@ -577,13 +648,19 @@ export class ETPortForwardHandler {
     }
 
     dispose (): void {
+        this.disposed = true
         for (const l of this.listeners) {
             l.server.close()
         }
         this.listeners = []
         for (const e of [...this.unassigned.values()]) {
+            clearTimeout(e.timer)
             e.socket.destroy()
         }
+        for (const s of this.pendingDestinationSockets) {
+            s.destroy()
+        }
+        this.pendingDestinationSockets.clear()
         for (const s of [...this.sourceSockets.values(), ...this.destinationSockets.values()]) {
             s.destroy()
         }

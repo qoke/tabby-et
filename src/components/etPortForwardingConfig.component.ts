@@ -58,7 +58,9 @@ export class ETPortForwardingConfigComponent {
 
     remove (fw: ForwardedPortConfig): void {
         this.forwardRemoved.emit(fw)
-        this.newForward = fw
+        // A session may refuse to remove a remote forward. Keep the form from
+        // mutating the still-active forward through the same object reference.
+        this.newForward = { ...fw }
     }
 
     importSpec (): void {

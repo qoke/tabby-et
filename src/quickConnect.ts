@@ -12,7 +12,7 @@ export interface ETQuickConnectTarget {
  * values past 65535, which then fail deep inside net.connect instead of here.
  */
 function parsePortOrDefault (text: string): number {
-    const parsed = parseInt(text, 10)
+    const parsed = /^\d+$/.test(text) ? Number(text) : NaN
     return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : DEFAULT_ET_PORT
 }
 

@@ -14,6 +14,7 @@ on:
       - '.github/workflows/tabby-preview.yml'
       - 'src/**'
       - 'scripts/**'
+      - 'tests/**'
       - 'package.json'
       - 'package-lock.json'
       - 'webpack.config.mjs'
@@ -34,6 +35,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run check:bundle
+      - run: npm test
       - run: npm pack --ignore-scripts
       - uses: actions/upload-artifact@v4
         with:

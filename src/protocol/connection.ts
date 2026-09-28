@@ -374,6 +374,10 @@ export class ETClientConnection {
                 if (status !== ETConnectStatus.RETURNING_CLIENT) {
                     release()
                     this.logger.warn(`Unexpected reconnect status ${status}; retrying`)
+                    if (this.options.maxReconnectAttempts > 0 && this.reconnectAttempts >= this.options.maxReconnectAttempts) {
+                        this.end(`Could not resume the session after ${this.reconnectAttempts} attempts`)
+                        return
+                    }
                     continue
                 }
 
