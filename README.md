@@ -30,7 +30,16 @@ The [Patched Tabby preview workflow](https://github.com/qoke/tabby-et/actions/wo
 - `tabby-macos-x86_64`: Intel DMG and ZIP.
 - `tabby-et-plugin`: the locally built npm tarball.
 
-Download the artifact for your Mac, mount the DMG, and copy `Tabby.app` to a separate location so it does not replace your normal Tabby installation. This preview is unsigned and not notarized; macOS may require you to open it through Finder's **Open** context menu.
+Download the artifact for your Mac, mount the DMG, and copy `Tabby.app` to a separate location so it does not replace your normal Tabby installation. Preview builds are signed ad hoc and verified in CI. They are **not notarized**. If macOS blocks the app, try opening it once, then use **System Settings → Privacy & Security → Open Anyway** to approve this specific app. See [Apple's instructions](https://support.apple.com/en-us/102445). Do not disable Gatekeeper system-wide.
+
+If macOS instead says the app is damaged, verify the downloaded image and copied app before attempting to open it again:
+
+```sh
+hdiutil verify /path/to/tabby-*-macos-*.dmg
+codesign --verify --deep --strict --verbose=2 "/path/to/Tabby.app"
+```
+
+If either check fails, download the artifact again and report the failed command's output. A Developer ID signature and notarization are required for a normal, warning-free macOS install; this community preview does not have those credentials.
 
 For a local plugin test, extract the plugin tarball and start the preview from Terminal:
 

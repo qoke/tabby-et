@@ -80,10 +80,34 @@ jobs:
         run: sed -i '' 's/updateInfo = await/\/\/updateInfo = await/g' node_modules/app-builder-lib/out/targets/ArchiveTarget.js
       - name: Link Electron dependencies for packaging
         run: ln -s ../../node_modules/electron app/node_modules
-      - name: Build unsigned DMG and ZIP
+      - name: Configure ad-hoc signing for the local preview
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          script = Path('scripts/build-macos.mjs')
+          content = script.read_text()
+          unsigned = 'identity: !process.env.CI || process.env.CSC_LINK ? undefined : null,'
+          assert content.count(unsigned) == 1, 'Tabby signing configuration changed'
+          script.write_text(content.replace(unsigned, "identity: '-',"))
+
+          entitlements = Path('build/mac/entitlements.plist')
+          content = entitlements.read_text()
+          closing = '  </dict>\n'
+          assert content.count(closing) == 1, 'Tabby entitlements changed'
+          content = content.replace(closing, '    <key>com.apple.security.cs.disable-library-validation</key>\n    <true/>\n' + closing)
+          entitlements.write_text(content)
+          PY
+      - name: Build ad-hoc signed DMG and ZIP
         run: scripts/build-macos.mjs
-      - name: Verify artifacts
-        run: ls -lh dist/*.dmg dist/*.zip
+      - name: Verify signed app and disk image
+        run: |
+          app_path="$(find dist -maxdepth 2 -type d -name Tabby.app -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          hdiutil verify dist/*.dmg
+          unzip -tq dist/*.zip
+          ls -lh dist/*.dmg dist/*.zip
       - uses: actions/upload-artifact@v4
         with:
           name: tabby-macos-${{ matrix.arch }}
