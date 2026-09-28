@@ -7,7 +7,8 @@
   "scripts": {
     "build": "webpack --config webpack.config.mjs",
     "watch": "webpack --config webpack.config.mjs --watch",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "test": "node --experimental-strip-types --test \"test/**/*.test.ts\""
   },
   "files": ["dist"],
   "author": "Relihan Myburgh",
