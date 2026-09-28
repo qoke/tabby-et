@@ -41,6 +41,14 @@ codesign --verify --deep --strict --verbose=2 "/path/to/Tabby.app"
 
 If either check fails, download the artifact again and report the failed command's output. A Developer ID signature and notarization are required for a normal, warning-free macOS install; this community preview does not have those credentials.
 
+If both checks pass but macOS still reports the app as damaged and does not offer **Open Anyway**, you can clear quarantine for this copied preview app alone:
+
+```sh
+xattr -dr com.apple.quarantine "/path/to/Tabby.app"
+```
+
+Only do this after verifying the app and confirming that it came from this workflow. Clearing quarantine bypasses Gatekeeper for that copy; it does not change your Mac's system-wide security settings.
+
 For a local plugin test, extract the plugin tarball and start the preview from Terminal:
 
 ```sh
