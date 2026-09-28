@@ -22,6 +22,27 @@ TABBY_PLUGINS="$PWD" /path/to/patched/tabby --debug
 
 `TABBY_PLUGINS` can point at this repository because it contains the plugin's `package.json` and built `dist/index.js`. Restart Tabby after installing or rebuilding the plugin.
 
+## Download a patched macOS Tabby build
+
+The [Patched Tabby preview workflow](https://github.com/qoke/tabby-et/actions/workflows/tabby-preview.yml) checks out `qoke/tabby` at `tabby-et-ssh-support`, runs Tabby's normal macOS build and packaging commands, and builds this plugin. Run it manually to select another branch or commit. Each successful run offers three downloadable artifacts for 30 days:
+
+- `tabby-macos-arm64`: Apple Silicon DMG and ZIP.
+- `tabby-macos-x86_64`: Intel DMG and ZIP.
+- `tabby-et-plugin`: the locally built npm tarball.
+
+Download the artifact for your Mac, mount the DMG, and copy `Tabby.app` to a separate location so it does not replace your normal Tabby installation. This preview is unsigned and not notarized; macOS may require you to open it through Finder's **Open** context menu.
+
+For a local plugin test, extract the plugin tarball and start the preview from Terminal:
+
+```sh
+mkdir -p "$HOME/tabby-et-preview"
+tar -xzf /path/to/tabby-et-0.1.0.tgz -C "$HOME/tabby-et-preview"
+TABBY_PLUGINS="$HOME/tabby-et-preview/package" \
+  "/path/to/Tabby.app/Contents/MacOS/Tabby"
+```
+
+This loads the copied plugin package into the preview build without publishing it to npm. The DMG and ZIP contain the same patched Tabby source; each artifact includes a `tabby-commit.txt` with the exact source commit.
+
 Once the upstream SSH changes are released and this plugin is published on npm, it can be installed through Tabby's Plugin Manager by searching for `tabby-et`. The npm package is not published yet.
 
 ## Development

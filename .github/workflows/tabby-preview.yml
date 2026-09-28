@@ -1,0 +1,95 @@
+name: Patched Tabby preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      tabby_ref:
+        description: Branch or commit in qoke/tabby to package
+        required: true
+        default: tabby-et-ssh-support
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tabby-preview.yml'
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'webpack.config.mjs'
+      - 'tsconfig.json'
+
+permissions:
+  contents: read
+
+jobs:
+  plugin:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm pack --ignore-scripts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tabby-et-plugin
+          path: tabby-et-*.tgz
+          if-no-files-found: error
+          retention-days: 30
+
+  macos:
+    needs: plugin
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            rust_triple: x86_64-apple-darwin
+          - arch: arm64
+            rust_triple: aarch64-apple-darwin
+    env:
+      ARCH: ${{ matrix.arch }}
+      RUST_TARGET_TRIPLE: ${{ matrix.rust_triple }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Check out Tabby with SSH support
+        uses: actions/checkout@v4
+        with:
+          repository: qoke/tabby
+          ref: ${{ inputs.tabby_ref || 'tabby-et-ssh-support' }}
+          fetch-depth: 0
+      - name: Fetch upstream release tags
+        run: git fetch --force --tags https://github.com/Eugeny/tabby.git
+      - name: Record Tabby source commit
+        run: git rev-parse HEAD > tabby-commit.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: rustup target add ${{ matrix.rust_triple }}
+      - name: Install Tabby dependencies
+        run: yarn --network-timeout 1000000
+      - name: Build Tabby
+        run: yarn run build
+      - name: Package built-in plugins
+        run: scripts/prepackage-plugins.mjs
+      - name: Apply upstream ArchiveTarget workaround
+        run: sed -i '' 's/updateInfo = await/\/\/updateInfo = await/g' node_modules/app-builder-lib/out/targets/ArchiveTarget.js
+      - name: Link Electron dependencies for packaging
+        run: ln -s ../../node_modules/electron app/node_modules
+      - name: Build unsigned DMG and ZIP
+        run: scripts/build-macos.mjs
+      - name: Verify artifacts
+        run: ls -lh dist/*.dmg dist/*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tabby-macos-${{ matrix.arch }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            tabby-commit.txt
+          if-no-files-found: error
+          retention-days: 30
