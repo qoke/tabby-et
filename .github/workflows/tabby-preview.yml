@@ -136,9 +136,14 @@ jobs:
           hdiutil verify dist/*.dmg
           unzip -tq dist/*.zip
           ls -lh dist/*.dmg dist/*.zip
+      - name: Give preview archives unique filenames
+        run: |
+          for archive in dist/*.dmg dist/*.zip; do
+            mv "$archive" "${archive%.*}-et-preview-run-${GITHUB_RUN_ID}.${archive##*.}"
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: tabby-macos-${{ matrix.arch }}
+          name: tabby-macos-${{ matrix.arch }}-run-${{ github.run_id }}
           path: |
             dist/*.dmg
             dist/*.zip
@@ -156,7 +161,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: tabby-macos-${{ matrix.arch }}
+          name: tabby-macos-${{ matrix.arch }}-run-${{ github.run_id }}
       - name: Verify downloaded DMG and launch copied app
         shell: bash
         run: |
