@@ -51,6 +51,8 @@ export const DEFAULT_GPU_GUARD_OPTIONS: Readonly<GPUGuardOptions> = {
 export interface CanvasLike {
     width: number
     height: number
+    /** False once the renderer has removed the canvas from the DOM. */
+    isConnected?: boolean
     getContext (type: string): unknown
 }
 
@@ -156,9 +158,16 @@ export function loseContexts (contexts: WebGLContextLike[]): number {
     return lost
 }
 
-/** A 0x0 canvas has no GPU backing store; this frees it without waiting for GC. */
+/**
+ * A 0x0 canvas has no GPU backing store; this frees it without waiting for GC.
+ * Only canvases the renderer has already removed from the DOM are touched:
+ * xterm's overview ruler and image layers stay live and keep their stores.
+ */
 export function releaseCanvasBackingStores (canvases: ArrayLike<CanvasLike>): void {
     for (const canvas of toArray(canvases)) {
+        if (canvas.isConnected !== false) {
+            continue
+        }
         try {
             canvas.width = 0
             canvas.height = 0

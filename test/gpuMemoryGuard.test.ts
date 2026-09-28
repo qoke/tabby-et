@@ -90,6 +90,7 @@ class FakeScheduler {
 interface FakeCanvas {
     width: number
     height: number
+    isConnected: boolean
     getContext (type: string): unknown
 }
 
@@ -103,6 +104,7 @@ function makeCanvas (kind: 'webgl' | '2d', order: string[] = []): { canvas: Fake
     const canvas: FakeCanvas = {
         width: 1920,
         height: 1080,
+        isConnected: true,
         getContext: (type: string) => kind === 'webgl' && (type === 'webgl2' || type === 'webgl') ? gl : null,
     }
     return { canvas, loseCalls }
@@ -126,8 +128,19 @@ function makeFrontend (opts: { pagesOnReattach?: FakePage[], withCanvases?: bool
     const order: string[] = []
     const webglCanvas = makeCanvas('webgl', order)
     const linkCanvas = makeCanvas('2d', order)
-    const canvases: FakeCanvas[] = opts.withCanvases === false ? [] : [webglCanvas.canvas, linkCanvas.canvas]
+    // Stays in the DOM when the WebGL renderer goes away, like xterm's overview ruler.
+    const rulerCanvas = makeCanvas('2d', order)
+    const rendererCanvases = [webglCanvas.canvas, linkCanvas.canvas]
+    const canvases: FakeCanvas[] = opts.withCanvases === false ? [] : [...rendererCanvases, rulerCanvas.canvas]
     const addon = makeAddon()
+    // The real addon removes its own canvases from the DOM on dispose.
+    const baseDispose = addon.dispose.bind(addon)
+    addon.dispose = () => {
+        baseDispose()
+        for (const canvas of rendererCanvases) {
+            canvas.isConnected = false
+        }
+    }
     const frontend = {
         enableWebGL: true,
         opened: true,
@@ -156,9 +169,13 @@ function makeFrontend (opts: { pagesOnReattach?: FakePage[], withCanvases?: bool
             order.push('destroy')
             this.webGLAddon?.dispose()
             this.webGLAddon = undefined
+            // xterm.dispose() removes the whole terminal element.
+            for (const canvas of canvases) {
+                canvas.isConnected = false
+            }
         },
     }
-    return { frontend, addon, webglCanvas, linkCanvas, canvases, order }
+    return { frontend, addon, webglCanvas, linkCanvas, rulerCanvas, canvases, order }
 }
 
 function makeGuard (frontend: any, options: Record<string, unknown> = {}) {
@@ -177,7 +194,7 @@ function makeGuard (frontend: any, options: Record<string, unknown> = {}) {
 
 describe('1. hidden tabs release their WebGL renderer and get it back when shown', () => {
     test('releases the addon and loses its GL context after the hidden delay', () => {
-        const { frontend, addon, webglCanvas, linkCanvas, canvases } = makeFrontend()
+        const { frontend, addon, webglCanvas, linkCanvas, rulerCanvas } = makeFrontend()
         const { visibility, scheduler } = makeGuard(frontend)
 
         visibility.next(false)
@@ -190,10 +207,12 @@ describe('1. hidden tabs release their WebGL renderer and get it back when shown
         assert.equal(frontend.webGLAddon, undefined, 'host no longer references the addon')
         assert.equal(webglCanvas.loseCalls.count, 1, 'WebGL context must be lost explicitly')
         assert.equal(linkCanvas.loseCalls.count, 0, '2D canvases have no GL context to lose')
-        for (const canvas of canvases) {
-            assert.equal(canvas.width, 0, 'canvas backing store released')
-            assert.equal(canvas.height, 0, 'canvas backing store released')
+        for (const canvas of [webglCanvas.canvas, linkCanvas.canvas]) {
+            assert.equal(canvas.width, 0, 'renderer canvas backing store released')
+            assert.equal(canvas.height, 0, 'renderer canvas backing store released')
         }
+        assert.equal(rulerCanvas.canvas.width, 1920, 'live overview ruler canvas untouched')
+        assert.equal(rulerCanvas.canvas.height, 1080, 'live overview ruler canvas untouched')
     })
 
     test('showing the tab again before the delay cancels the release', () => {
