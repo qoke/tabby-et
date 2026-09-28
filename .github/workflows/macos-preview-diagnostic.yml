@@ -30,7 +30,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          dmg="$(find . -maxdepth 1 -name '*.dmg' -print -quit)"
+          find . -maxdepth 3 -type f -print
+          dmg="$(find . -maxdepth 3 -name '*.dmg' -print -quit)"
           test -n "$dmg"
           hdiutil verify "$dmg"
           mount_dir="$(mktemp -d)"
