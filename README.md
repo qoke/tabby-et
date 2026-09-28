@@ -24,30 +24,29 @@ TABBY_PLUGINS="$PWD" /path/to/patched/tabby --debug
 
 ## Download a patched macOS Tabby build
 
-The [Patched Tabby preview workflow](https://github.com/qoke/tabby-et/actions/workflows/tabby-preview.yml) checks out `qoke/tabby` at `tabby-et-ssh-support`, runs the same typings and lint commands as Tabby's PR workflow, runs Tabby's normal macOS build and packaging commands, and builds this plugin. Run it manually to select another branch or commit. Each successful run offers three downloadable artifacts for 30 days:
+The [Patched Tabby preview workflow](https://github.com/qoke/tabby-et/actions/workflows/tabby-preview.yml) checks out `qoke/tabby` at `tabby-et-ssh-support`, runs the same typings and lint commands as Tabby's PR workflow, runs Tabby's normal macOS build and packaging commands, builds this plugin, and tests a copied app from each downloaded DMG on a Mac runner. Run it manually to select another branch or commit. Each successful run offers three downloadable artifacts for 30 days:
 
 - `tabby-macos-arm64`: Apple Silicon DMG and ZIP.
 - `tabby-macos-x86_64`: Intel DMG and ZIP.
 - `tabby-et-plugin`: the locally built npm tarball.
 
-Download the artifact for your Mac, mount the DMG, and copy `Tabby.app` to a separate location so it does not replace your normal Tabby installation. Preview builds are signed ad hoc and verified in CI. They are **not notarized**. If macOS blocks the app, try opening it once, then use **System Settings → Privacy & Security → Open Anyway** to approve this specific app. See [Apple's instructions](https://support.apple.com/en-us/102445). Do not disable Gatekeeper system-wide.
+Download the artifact for your Mac, mount the DMG, and copy `Tabby.app` to a separate location so it does not replace your normal Tabby installation. Preview builds are signed ad hoc and verified in CI. They are **not signed with an Apple Developer ID or notarized**, so Gatekeeper rejects a downloaded copy; macOS may say the app is damaged. This is expected for this local preview, even when the app's signature is intact. [Apple explains that Gatekeeper normally accepts Developer ID signed apps](https://developer.apple.com/library/archive/technotes/tn2206/).
 
-If macOS instead says the app is damaged, verify the downloaded image and copied app before attempting to open it again:
+Verify the downloaded image and copied app:
 
 ```sh
 hdiutil verify /path/to/tabby-*-macos-*.dmg
 codesign --verify --deep --strict --verbose=2 "/path/to/Tabby.app"
 ```
 
-If either check fails, download the artifact again and report the failed command's output. A Developer ID signature and notarization are required for a normal, warning-free macOS install; this community preview does not have those credentials.
-
-If both checks pass but macOS still reports the app as damaged and does not offer **Open Anyway**, you can clear quarantine for this copied preview app alone:
+Stop if either verification command fails, and report its output. Once both pass and you have confirmed the DMG came from this workflow, clear quarantine for that copied preview app alone and open it:
 
 ```sh
 xattr -dr com.apple.quarantine "/path/to/Tabby.app"
+open "/path/to/Tabby.app"
 ```
 
-Only do this after verifying the app and confirming that it came from this workflow. Clearing quarantine bypasses Gatekeeper for that copy; it does not change your Mac's system-wide security settings.
+This bypasses Gatekeeper for that copy only; it does not change your Mac's system-wide security settings. A Developer ID signature and notarization are required for a normal, warning-free macOS install; this preview does not have those credentials. The [Mac runner diagnosis](https://github.com/qoke/tabby-et/actions/runs/36393012555) verified that both downloaded DMGs contain intact apps and launch after this step.
 
 For a local plugin test, extract the plugin tarball and start the preview from Terminal:
 

@@ -145,3 +145,35 @@ jobs:
             tabby-commit.txt
           if-no-files-found: error
           retention-days: 30
+
+  macos-smoke:
+    needs: macos
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tabby-macos-${{ matrix.arch }}
+      - name: Verify downloaded DMG and launch copied app
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="$(find . -maxdepth 3 -name '*.dmg' -print -quit)"
+          test -n "$dmg"
+          hdiutil verify "$dmg"
+          mount_dir="$(mktemp -d)"
+          copy_dir="$(mktemp -d)"
+          trap 'hdiutil detach "$mount_dir" || true; rm -rf "$mount_dir" "$copy_dir"' EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_dir" "$dmg"
+          codesign --verify --deep --strict --verbose=2 "$mount_dir/Tabby.app"
+          ditto "$mount_dir/Tabby.app" "$copy_dir/Tabby.app"
+          codesign --verify --deep --strict --verbose=2 "$copy_dir/Tabby.app"
+          xattr -w com.apple.quarantine '0081;00000000;GitHub Actions;preview' "$copy_dir/Tabby.app"
+          xattr -dr com.apple.quarantine "$copy_dir/Tabby.app"
+          codesign --verify --deep --strict --verbose=2 "$copy_dir/Tabby.app"
+          open -n "$copy_dir/Tabby.app"
+          sleep 5
+          ps -axo pid,command | grep '[T]abby.app/Contents/MacOS/Tabby'
