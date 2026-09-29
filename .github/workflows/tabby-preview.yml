@@ -1,0 +1,253 @@
+name: Patched Tabby preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      tabby_ref:
+        description: Branch or commit in qoke/tabby to package
+        required: true
+        default: tabby-et-ssh-support
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tabby-preview.yml'
+      - 'src/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'webpack.config.mjs'
+      - 'tsconfig.json'
+
+permissions:
+  contents: read
+
+jobs:
+  plugin:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run check:bundle
+      - run: npm test
+      - run: npm pack --ignore-scripts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tabby-et-plugin
+          path: tabby-et-*.tgz
+          if-no-files-found: error
+          retention-days: 30
+
+  tabby-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out Tabby with SSH support
+        uses: actions/checkout@v4
+        with:
+          repository: qoke/tabby
+          ref: ${{ inputs.tabby_ref || 'tabby-et-ssh-support' }}
+          fetch-depth: 0
+      - name: Fetch upstream release tags
+        run: git fetch --force --tags https://github.com/Eugeny/tabby.git
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Tabby dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libsecret-1-dev
+          npm i -g yarn
+          cd app
+          yarn
+          cd ..
+          rm app/node_modules/.yarn-integrity
+          yarn
+      - name: Build Tabby typings
+        run: yarn run build:typings
+      - name: Run Tabby's PR lint gate
+        run: yarn run lint
+
+  # That Tabby starts says nothing of the plugin: one that cannot be loaded is
+  # left out, and Tabby starts without it. Here Tabby is built, started with
+  # the package that was just made, and asked whether the plugin is there.
+  linux-smoke:
+    needs: plugin
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tabby-et
+      - name: Check out Tabby with SSH support
+        uses: actions/checkout@v4
+        with:
+          repository: qoke/tabby
+          ref: ${{ inputs.tabby_ref || 'tabby-et-ssh-support' }}
+          path: tabby
+          fetch-depth: 0
+      - name: Fetch upstream release tags
+        working-directory: tabby
+        run: git fetch --force --tags https://github.com/Eugeny/tabby.git
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Tabby dependencies
+        working-directory: tabby
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libsecret-1-dev xvfb
+          npm i -g yarn
+          cd app
+          yarn
+          cd ..
+          rm app/node_modules/.yarn-integrity
+          yarn
+          node node_modules/electron/install.js
+      - name: Build Tabby
+        working-directory: tabby
+        run: yarn run build
+      - uses: actions/download-artifact@v4
+        with:
+          name: tabby-et-plugin
+          path: packed
+      - name: Unpack the plugin where Tabby is to find it
+        run: |
+          mkdir -p plugins/tabby-et
+          tar -xzf packed/tabby-et-*.tgz -C plugins/tabby-et --strip-components=1
+      - name: Start Tabby with the plugin, and ask it whether the plugin is there
+        run: xvfb-run -a node tabby-et/scripts/smoke-tabby.mjs --tabby tabby --plugin plugins/tabby-et
+
+  macos:
+    needs: [plugin, tabby-lint]
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            rust_triple: x86_64-apple-darwin
+          - arch: arm64
+            rust_triple: aarch64-apple-darwin
+    env:
+      ARCH: ${{ matrix.arch }}
+      RUST_TARGET_TRIPLE: ${{ matrix.rust_triple }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Check out Tabby with SSH support
+        uses: actions/checkout@v4
+        with:
+          repository: qoke/tabby
+          ref: ${{ inputs.tabby_ref || 'tabby-et-ssh-support' }}
+          fetch-depth: 0
+      - name: Fetch upstream release tags
+        run: git fetch --force --tags https://github.com/Eugeny/tabby.git
+      - name: Record Tabby source commit
+        run: git rev-parse HEAD > tabby-commit.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: rustup target add ${{ matrix.rust_triple }}
+      - name: Install Tabby dependencies
+        run: yarn --network-timeout 1000000
+      - name: Build Tabby
+        run: yarn run build
+      - name: Package built-in plugins
+        run: scripts/prepackage-plugins.mjs
+      - name: Apply upstream ArchiveTarget workaround
+        run: sed -i '' 's/updateInfo = await/\/\/updateInfo = await/g' node_modules/app-builder-lib/out/targets/ArchiveTarget.js
+      - name: Link Electron dependencies for packaging
+        run: ln -s ../../node_modules/electron app/node_modules
+      - name: Configure ad-hoc signing for the local preview
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          script = Path('scripts/build-macos.mjs')
+          content = script.read_text()
+          unsigned = 'identity: !process.env.CI || process.env.CSC_LINK ? undefined : null,'
+          assert content.count(unsigned) == 1, 'Tabby signing configuration changed'
+          script.write_text(content.replace(unsigned, "identity: '-',"))
+
+          entitlements = Path('build/mac/entitlements.plist')
+          content = entitlements.read_text()
+          closing = '  </dict>\n'
+          assert content.count(closing) == 1, 'Tabby entitlements changed'
+          content = content.replace(closing, '    <key>com.apple.security.cs.disable-library-validation</key>\n    <true/>\n' + closing)
+          entitlements.write_text(content)
+          PY
+      - name: Build ad-hoc signed DMG and ZIP
+        run: scripts/build-macos.mjs
+      - name: Verify signed app and disk image
+        run: |
+          app_path="$(find dist -maxdepth 2 -type d -name Tabby.app -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          hdiutil verify dist/*.dmg
+          unzip -tq dist/*.zip
+          ls -lh dist/*.dmg dist/*.zip
+      - name: Give preview archives unique filenames
+        run: |
+          for archive in dist/*.dmg dist/*.zip; do
+            mv "$archive" "${archive%.*}-et-preview-run-${GITHUB_RUN_ID}.${archive##*.}"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tabby-macos-${{ matrix.arch }}-run-${{ github.run_id }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            tabby-commit.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  macos-smoke:
+    needs: macos
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tabby-macos-${{ matrix.arch }}-run-${{ github.run_id }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: tabby-et-plugin
+          path: packed
+      - name: Verify downloaded DMG and launch copied app
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="$(find . -maxdepth 3 -name '*.dmg' -print -quit)"
+          test -n "$dmg"
+          hdiutil verify "$dmg"
+          mount_dir="$(mktemp -d)"
+          copy_dir="$(mktemp -d)"
+          trap 'hdiutil detach "$mount_dir" || true; rm -rf "$mount_dir" "$copy_dir"' EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_dir" "$dmg"
+          codesign --verify --deep --strict --verbose=2 "$mount_dir/Tabby.app"
+          ditto "$mount_dir/Tabby.app" "$copy_dir/Tabby.app"
+          codesign --verify --deep --strict --verbose=2 "$copy_dir/Tabby.app"
+          xattr -w com.apple.quarantine '0081;00000000;GitHub Actions;preview' "$copy_dir/Tabby.app"
+          xattr -dr com.apple.quarantine "$copy_dir/Tabby.app"
+          codesign --verify --deep --strict --verbose=2 "$copy_dir/Tabby.app"
+          # With the plugin, so that what is launched is what will be used.
+          plugin_dir="$copy_dir/plugins/tabby-et"
+          mkdir -p "$plugin_dir"
+          tar -xzf packed/tabby-et-*.tgz -C "$plugin_dir" --strip-components=1
+          log="$copy_dir/tabby.log"
+          open -n --env TABBY_PLUGINS="$plugin_dir" --env ELECTRON_ENABLE_LOGGING=1 \
+            --stdout "$log" --stderr "$log" "$copy_dir/Tabby.app"
+          sleep 20
+          ps -axo pid,command | grep '[T]abby.app/Contents/MacOS/Tabby'
+          if grep -q '"Could not load et' "$log"; then
+            grep '"Could not load et' "$log"
+            exit 1
+          fi
+          # The Linux job asks Tabby itself. This one goes by what Tabby says,
+          # if it can be heard at all from an application that was opened.
+          grep -q '"Loading et: ' "$log" || echo "::warning::Tabby was not heard to load the plugin"
