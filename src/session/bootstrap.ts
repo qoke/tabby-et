@@ -9,6 +9,7 @@ import { ET_TERM } from '../protocol/constants'
 import { generateBootstrapId, generateBootstrapPasskey } from '../protocol/crypto'
 import { redactCredentials } from '../redact'
 import { getCaptureLimit } from './captureLimit'
+import { resolveText, resolveVerbosity } from './options'
 
 const IDPASSKEY_RE = /IDPASSKEY:([A-Za-z0-9]{16})\/([A-Za-z0-9]{32})/
 const BOOTSTRAP_TIMEOUT = 30000
@@ -34,6 +35,12 @@ export class ETBootstrap {
     private logger: Logger
     private profiles: ProfilesService
     private config: ConfigService
+    private cancelled = false
+    private rejectOnCancel: (err: Error) => void
+    /** Rejects when cancel() is called; every wait in run() races against it. */
+    private cancellation = new Promise<never>((_, reject) => {
+        this.rejectOnCancel = reject
+    })
 
     constructor (
         private injector: Injector,
@@ -42,6 +49,30 @@ export class ETBootstrap {
         this.logger = injector.get(LogService).create('et-bootstrap')
         this.profiles = injector.get(ProfilesService)
         this.config = injector.get(ConfigService)
+        // Nothing may be waiting when cancel() is called, and that is fine.
+        this.cancellation.catch(() => null)
+    }
+
+    /**
+     * Abandon a bootstrap that is in flight, and refuse to start another.
+     *
+     * SSHSession.start() can wait on the user indefinitely - a password prompt,
+     * an unknown host key - so it cannot be relied on to settle by itself once
+     * the tab that would have shown the prompt is gone. run() rejects at once
+     * and disconnects the SSH session on its way out.
+     */
+    cancel (): void {
+        if (this.cancelled) {
+            return
+        }
+        this.cancelled = true
+        this.rejectOnCancel(new Error('The SSH bootstrap was cancelled'))
+    }
+
+    private orCancelled <T> (work: Promise<T>): Promise<T> {
+        // Listed first on purpose: when both have already settled, race() goes
+        // to the earlier entry, and a cancellation must win that tie.
+        return Promise.race([this.cancellation, work])
     }
 
     /**
@@ -50,7 +81,7 @@ export class ETBootstrap {
      * credentials the destination already gave us.
      */
     async run (options?: { credentials?: ETCredentials, jumpTo?: { host: string, port: number } }): Promise<ETCredentials> {
-        const sshProfile = await this.resolveSSHProfile(options?.jumpTo ? 'jump' : 'destination')
+        const sshProfile = await this.orCancelled(this.resolveSSHProfile(options?.jumpTo ? 'jump' : 'destination'))
         const command = this.buildCommand(sshProfile.options.user, options)
 
         // Redact: on the jump-host path the command embeds the real id/passkey.
@@ -59,8 +90,10 @@ export class ETBootstrap {
         const session = new SSHSession(this.injector, sshProfile)
         this.sshSessionCreated.next(session)
         try {
-            await session.start()
-            const output = await this.execAndCapture(session, command, getCaptureLimit(this.profile.options.bootstrapCaptureLimit))
+            await this.orCancelled(session.start())
+            const output = await this.orCancelled(
+                this.execAndCapture(session, command, getCaptureLimit(this.profile.options.bootstrapCaptureLimit)),
+            )
             const match = IDPASSKEY_RE.exec(output.stdout)
             if (!match) {
                 throw new Error(this.explainMissingMarker(output))
@@ -83,13 +116,18 @@ export class ETBootstrap {
         const passkey = options?.credentials?.passkey ?? generateBootstrapPasskey()
 
         // Per-profile path wins, then the global default from Settings (which
-        // would otherwise be dead config), then the remote PATH.
-        const binary = this.profile.options.etterminalPath
-            ?? this.config.store.et.defaultEtterminalPath
+        // would otherwise be dead config), then the remote PATH. A path field
+        // that was filled in and then cleared holds '', not null: `??` would
+        // take it for a path and run `''` as the remote command.
+        const binary = resolveText(this.profile.options.etterminalPath)
+            ?? resolveText(this.config.store.et.defaultEtterminalPath)
             ?? 'etterminal'
-        const args = [`--verbose=${this.profile.options.verbose}`]
-        if (this.profile.options.serverFifo) {
-            args.push(`--serverfifo=${this.profile.options.serverFifo}`)
+        // Likewise a cleared number field holds null, and `--verbose=null` makes
+        // etterminal exit before it prints the session key.
+        const args = [`--verbose=${resolveVerbosity(this.profile.options.verbose)}`]
+        const serverFifo = resolveText(this.profile.options.serverFifo)
+        if (serverFifo) {
+            args.push(`--serverfifo=${serverFifo}`)
         }
         if (options?.jumpTo) {
             args.push('--jump', `--dsthost=${options.jumpTo.host}`, `--dstport=${options.jumpTo.port}`)

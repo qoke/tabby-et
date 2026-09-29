@@ -2,6 +2,7 @@ import { Socket } from 'net'
 import { ETCrypto, MAC_BYTES } from './crypto'
 import { DISCONNECT_BUFFER_BYTES, MAX_BACKUP_BYTES, PACKET_HEADER_SIZE } from './constants'
 import { UnrecoverableSessionError } from './errors'
+import { PacketQueue } from './packetQueue'
 
 // Re-exported for the existing importers: the type now lives in ./errors so that
 // crypto.ts can raise it too without a cycle (backedWriter already imports crypto).
@@ -20,21 +21,53 @@ export class BackedWriter {
     /** Number of packets ever written, including while disconnected. */
     sequenceNumber = 0
 
-    /** Newest first, matching ET's push_front/pop_back deque. */
-    private backupBuffer: Buffer[] = []
+    /** Everything we may still have to replay, oldest first. */
+    private backupBuffer = new PacketQueue()
     private backupSize = 0
     private disconnectedBytes = 0
     private socket: Socket|null = null
+    /**
+     * How much of our stream the peer can account for: every packet up to this
+     * sequence number was either written to a socket or offered in a recovery
+     * catch-up. Anything past it exists only in the replay buffer.
+     */
+    private handedOff = 0
 
     constructor (private crypto: ETCrypto) {}
 
+    /**
+     * Start writing to `socket`, beginning with whatever nothing has carried yet.
+     *
+     * recover() sizes the catch-up from the sequence number at that instant, but
+     * the exchange then waits on the network and packets keep being written
+     * meanwhile. The reference client holds its writer mutex from recover() to
+     * revive(), so those writes block and then go out on the new socket. We
+     * cannot block, so they are buffered and sent here instead. Skipping them
+     * would leave a hole in the stream: the next packet would reach the server
+     * under a nonce it does not expect yet, and etserver aborts on a failed
+     * MAC check.
+     */
     attach (socket: Socket): void {
         this.socket = socket
         this.disconnectedBytes = 0
+        // Nothing is trimmed while disconnected, so the newest `pending` entries
+        // are exactly the packets in question. Oldest first.
+        for (const serialized of this.backupBuffer.newest(this.sequenceNumber - this.handedOff)) {
+            this.send(socket, serialized)
+        }
+        this.handedOff = this.sequenceNumber
     }
 
     detach (): void {
         this.socket = null
+    }
+
+    /**
+     * Bytes we have accepted that the network has not taken yet: queued on the
+     * socket, or waiting for there to be a socket.
+     */
+    get backlog (): number {
+        return this.socket ? this.socket.writableLength : this.disconnectedBytes
     }
 
     /**
@@ -59,13 +92,13 @@ export class BackedWriter {
 
         const serialized = serializePacket(header, this.crypto.encrypt(payload))
 
-        this.backupBuffer.unshift(serialized)
+        this.backupBuffer.push(serialized)
         this.backupSize += serialized.length
         this.sequenceNumber++
 
         // Only trim while connected - never discard data we may still have to replay.
         while (this.socket && this.backupSize > MAX_BACKUP_BYTES) {
-            this.backupSize -= this.backupBuffer.pop()!.length
+            this.backupSize -= this.backupBuffer.shift()!.length
         }
 
         if (!this.socket) {
@@ -73,11 +106,16 @@ export class BackedWriter {
             return true
         }
 
+        this.send(this.socket, serialized)
+        this.handedOff = this.sequenceNumber
+        return true
+    }
+
+    private send (socket: Socket, serialized: Buffer): void {
         const frame = Buffer.allocUnsafe(4 + serialized.length)
         frame.writeInt32BE(serialized.length, 0) // BIG-endian, 4 bytes, excludes itself
         serialized.copy(frame, 4)
-        this.socket.write(frame)
-        return true
+        socket.write(frame)
     }
 
     /** Packets the peer says it never received, oldest first. */
@@ -88,14 +126,14 @@ export class BackedWriter {
                 'the server has received more packets than we ever sent (we are behind the server)',
             )
         }
-        if (toRecover === 0) {
-            return []
-        }
         if (toRecover > this.backupBuffer.length) {
             throw new UnrecoverableSessionError(
                 'the packets the server is missing have already been trimmed from the replay buffer',
             )
         }
-        return this.backupBuffer.slice(0, toRecover).reverse()
+        // The catch-up carries everything written so far. Whatever is written
+        // from here on is attach()'s to send.
+        this.handedOff = this.sequenceNumber
+        return this.backupBuffer.newest(toRecover)
     }
 }

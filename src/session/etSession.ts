@@ -10,14 +10,28 @@ import { KeyboardInteractivePrompt, SSHSession } from 'tabby-ssh'
 import { ETProfile } from '../api/interfaces'
 import { ETClientConnection, ETConnectionState } from '../protocol/connection'
 import {
-    ETPacketType, INITIAL_RESPONSE_TIMEOUT, PING_TIMEOUT, TERMINAL_CHUNK_SIZE,
+    DEFAULT_ET_PORT, ETPacketType, INITIAL_RESPONSE_TIMEOUT, PING_TIMEOUT, TERMINAL_CHUNK_SIZE,
 } from '../protocol/constants'
 import {
     decodeInitialResponse, decodeTerminalBuffer, encodeInitialPayload,
     encodeTerminalBuffer, encodeTerminalInfo,
 } from '../protocol/messages'
 import { ETBootstrap } from './bootstrap'
+import { resolveEnvironment, resolvePort, resolveText } from './options'
 import { ETPortForwardHandler } from './portForwarding'
+
+/**
+ * What start() fails with when the session was destroyed while it was starting.
+ *
+ * It is not a connection failure: the tab was closed, the user asked for a new
+ * session, or the connection ended and already said why. Callers can tell it
+ * apart so that they do not report a teardown as an error.
+ */
+export class ETSessionDestroyedError extends Error {
+    constructor () {
+        super('The session was closed before it finished connecting')
+    }
+}
 
 export class ETSession extends BaseSession {
     get serviceMessage$ (): Observable<string> { return this.serviceMessage }
@@ -36,6 +50,8 @@ export class ETSession extends BaseSession {
 
     private connection: ETClientConnection|null = null
     private bootstrap: ETBootstrap|null = null
+    /** The reachability probe, while it is in flight. */
+    private probe: Socket|null = null
     private keepaliveTimer: any = null
     private awaitingKeepalive = false
     /** When we last saw INBOUND traffic. Outbound writes deliberately do not count. */
@@ -43,6 +59,10 @@ export class ETSession extends BaseSession {
     private lastSize = { columns: 0, rows: 0 }
     private initialResponse: { resolve: () => void, reject: (e: Error) => void }|null = null
     private droppedInputSinceReconnect = false
+    /** Set by destroy(). start() stops at the next step once it is. */
+    private disposed = false
+    /** INITIAL_PAYLOAD has been written, so terminal input may follow it. */
+    private inputEnabled = false
 
     constructor (
         private injector: Injector,
@@ -60,22 +80,56 @@ export class ETSession extends BaseSession {
             // know. No connection at all counts as a drop.
             (header, payload) => this.connection?.writePacket(header, payload) ?? false,
             msg => this.emitServiceMessage(msg),
+            () => this.connection?.congested ?? false,
         )
     }
 
     // ---- lifecycle --------------------------------------------------------
 
+    /**
+     * Connect. Rejects with ETSessionDestroyedError if destroy() is called before
+     * the session is live, whichever step happened to be in flight.
+     */
     async start (): Promise<void> {
+        try {
+            await this.connect()
+        } catch (err) {
+            throw this.disposed ? new ETSessionDestroyedError() : err
+        }
+    }
+
+    /**
+     * Every await in here is a point where the tab can be closed, or a new
+     * session asked for. Tabby only destroys a session that is already open, and
+     * a destroyed session that carried on would go live with nobody to own it:
+     * a connection, a keepalive timer and bound local ports, until Tabby exits.
+     */
+    private throwIfDestroyed (): void {
+        if (this.disposed) {
+            throw new ETSessionDestroyedError()
+        }
+    }
+
+    private async connect (): Promise<void> {
         const o = this.profile.options
+        this.throwIfDestroyed()
+
+        const host = resolveText(o.host)
+        if (!host) {
+            throw new Error('This profile has no host to connect to')
+        }
+        const port = resolvePort(o.port, DEFAULT_ET_PORT, 'etserver port')
+        const jumpHost = resolveText(o.jumpHost)
 
         // 3 (computed early). With an ET-native jump host the destination may not
         // accept direct TCP at all, so we probe whatever we will actually connect to.
-        const target = o.jumpHost
-            ? { host: o.jumpHost, port: o.jumpPort }
-            : { host: o.host, port: o.port }
+        const target = jumpHost
+            ? { host: jumpHost, port: resolvePort(o.jumpPort, DEFAULT_ET_PORT, 'jump host port') }
+            : { host, port }
 
         // 1. Fail fast if etserver is unreachable, exactly as `et` does.
         await this.ping(target.host, target.port)
+        this.throwIfDestroyed()
 
         // 2. Bootstrap over SSH.
         this.emitServiceMessage(colors.bgBlue.black(' SSH ') + ' Starting the remote session')
@@ -87,14 +141,16 @@ export class ETSession extends BaseSession {
         })
 
         let credentials = await this.bootstrap.run()
+        this.throwIfDestroyed()
 
         // 2b. ET-native jump host: bootstrap the jump host with the same credentials.
-        if (o.jumpHost) {
-            this.emitServiceMessage(colors.bgBlue.black(' JUMP ') + ` Preparing ${o.jumpHost}`)
+        if (jumpHost) {
+            this.emitServiceMessage(colors.bgBlue.black(' JUMP ') + ` Preparing ${jumpHost}`)
             credentials = await this.bootstrap.run({
                 credentials,
-                jumpTo: { host: o.host, port: o.port },
+                jumpTo: { host, port },
             })
+            this.throwIfDestroyed()
         }
 
         this.connection = new ETClientConnection({
@@ -112,18 +168,22 @@ export class ETSession extends BaseSession {
 
         this.connection.packet$.subscribe(p => this.handlePacket(p.header, p.payload))
         this.connection.state$.subscribe(s => this.onConnectionState(s))
+        this.connection.drained$.subscribe(() => this.forwards.resume())
         this.connection.ended$.subscribe(reason => {
             this.emitServiceMessage(colors.bgRed.black(' X ') + ` ${reason}`)
             this.destroy()
         })
 
         await this.connection.connect()
+        this.throwIfDestroyed()
 
         // 4. INITIAL_PAYLOAD / INITIAL_RESPONSE.
         await this.sendInitialPayload()
+        this.throwIfDestroyed()
 
         // 5. Local listeners for forward tunnels.
         await this.forwards.startLocalForwards(o.forwardedPorts)
+        this.throwIfDestroyed()
 
         // 6. Go live.
         this.open = true
@@ -136,29 +196,41 @@ export class ETSession extends BaseSession {
     private ping (host: string, port: number): Promise<void> {
         return new Promise((resolve, reject) => {
             const socket = new Socket()
-            const fail = () => {
+            this.probe = socket
+            let settled = false
+            const finish = (reachable: boolean) => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                if (this.probe === socket) {
+                    this.probe = null
+                }
                 socket.destroy()
-                reject(new Error(
-                    `Could not reach the ET server at ${host}:${port}. `
-                    + 'Check that etserver is running and the port is open.',
-                ))
+                if (reachable) {
+                    resolve()
+                } else {
+                    reject(new Error(
+                        `Could not reach the ET server at ${host}:${port}. `
+                        + 'Check that etserver is running and the port is open.',
+                    ))
+                }
             }
             socket.setTimeout(PING_TIMEOUT)
-            socket.once('timeout', fail)
-            socket.once('error', fail)
-            socket.connect(port, host, () => {
-                socket.destroy()
-                resolve()
-            })
+            socket.once('timeout', () => finish(false))
+            socket.once('error', () => finish(false))
+            // destroy() closes the probe without an 'error'.
+            socket.once('close', () => finish(false))
+            socket.connect(port, host, () => finish(true))
         })
     }
 
     private sendInitialPayload (): Promise<void> {
         const o = this.profile.options
         const payload = encodeInitialPayload({
-            jumphost: !!o.jumpHost,
+            jumphost: !!resolveText(o.jumpHost),
             reverseTunnels: this.forwards.buildReverseTunnelRequests(o),
-            environmentVariables: o.environmentVariables,
+            environmentVariables: resolveEnvironment(o.environmentVariables),
         })
 
         const promise = new Promise<void>((resolve, reject) => {
@@ -183,6 +255,7 @@ export class ETSession extends BaseSession {
             }
         })
         this.connection!.writePacket(ETPacketType.INITIAL_PAYLOAD, payload)
+        this.inputEnabled = true
         return promise
     }
 
@@ -261,7 +334,13 @@ export class ETSession extends BaseSession {
     // ---- BaseSession contract ---------------------------------------------
 
     write (data: Buffer): void {
-        if (!this.connection) {
+        // INITIAL_PAYLOAD has to be the first packet the server decrypts, and
+        // etserver aborts - taking every user's session with it - if it is not.
+        // Tabby forwards keystrokes to a session before it is open, so whatever
+        // is typed while we are still connecting is dropped here. It could not
+        // be sent early even in principle: encrypting it would take the nonce
+        // that INITIAL_PAYLOAD needs.
+        if (!this.connection || !this.inputEnabled) {
             return
         }
         // Chunk to match ET's own 16 KiB reads.
@@ -308,7 +387,17 @@ export class ETSession extends BaseSession {
     }
 
     async destroy (): Promise<void> {
+        // Several owners can end a session - the tab, the connection's ended$,
+        // a failed start() - and more than one of them usually does.
+        if (this.disposed) {
+            return
+        }
+        this.disposed = true
         this.stopKeepalive()
+        this.probe?.destroy()
+        // An SSH bootstrap may be parked on a prompt that nobody is going to
+        // answer now; without this it, and start(), would wait forever.
+        this.bootstrap?.cancel()
         this.forwards.dispose()
         this.connection?.shutdown()
         this.connection = null
@@ -316,6 +405,12 @@ export class ETSession extends BaseSession {
         // flight cannot outlive the session.
         this.initialResponse?.reject(new Error('Session destroyed'))
         this.initialResponse = null
+        // shutdown() reports 'ended' for us, but only a session that got as far
+        // as having a connection has one to shut down.
+        if (this.connectionState !== 'ended') {
+            this.connectionState = 'ended'
+            this.connectionStateSubject.next('ended')
+        }
         this.serviceMessage.complete()
         this.kiPrompt.complete()
         this.connectionStateSubject.complete()

@@ -122,6 +122,15 @@ export class ETPortForwardHandler {
     /** Destination sockets that are connecting but not yet in destinationSockets. */
     private pendingDestinations = 0
     private pendingDestinationSockets = new Set<Socket>()
+    /**
+     * Sockets whose tunnel the peer has closed, still delivering what was queued
+     * for the local endpoint. They are in neither socket map - the peer has
+     * forgotten their ids and may hand them out again - but they are open file
+     * descriptors all the same, and stay ours to account for and to close.
+     */
+    private lingering = new Map<Socket, Role>()
+    /** Sockets we have stopped reading from until the connection can take more. */
+    private throttled = new Set<Socket>()
     private disposed = false
     private nextToken = 1
     private nextSocketId = 1
@@ -130,7 +139,18 @@ export class ETPortForwardHandler {
         private logger: Logger,
         private send: Send,
         private emitServiceMessage: (msg: string) => void,
+        /** Is more waiting to go out than the connection can sensibly hold? */
+        private congested: () => boolean = () => false,
     ) {}
+
+    /** The connection can take more: let the tunnels that were held back read on. */
+    resume (): void {
+        const held = [...this.throttled]
+        this.throttled.clear()
+        for (const socket of held) {
+            socket.resume()
+        }
+    }
 
     // ---- setup ------------------------------------------------------------
 
@@ -188,10 +208,14 @@ export class ETPortForwardHandler {
             this.listeners.splice(index, 1)
             this.forgetActiveForwards(x => x === config)
             // The forward no longer exists from the user's point of view, so its
-            // live tunnelled connections go too.
-            for (const [socketId, owned] of this.sourceSocketConfigs) {
-                if (owned === config) {
-                    this.sourceSockets.get(socketId)?.destroy()
+            // live tunnelled connections go too - at both ends. The peer only
+            // closes its half when told to, and would otherwise keep a
+            // connection to the remote service open for as long as the session
+            // lasts.
+            for (const [socketId, owned] of [...this.sourceSocketConfigs]) {
+                const socket = this.sourceSockets.get(socketId)
+                if (owned === config && socket) {
+                    this.closeForwardedSocket('source', socketId, socket)
                 }
             }
             for (const [token, entry] of this.unassigned) {
@@ -377,7 +401,7 @@ export class ETPortForwardHandler {
             return
         }
 
-        if (this.destinationSockets.size + this.pendingDestinations >= MAX_CONCURRENT_DESTINATION_SOCKETS) {
+        if (this.openDestinationSockets >= MAX_CONCURRENT_DESTINATION_SOCKETS) {
             this.logger.warn('Refused a port-forward destination: too many concurrent forwarded connections')
             this.sendDestinationError(request.fd, new Error('Too many concurrent forwarded connections'))
             return
@@ -442,6 +466,17 @@ export class ETPortForwardHandler {
                 failed(err as Error)
             }
         }
+    }
+
+    /** Every socket the peer has had us open that is not closed yet, in any state. */
+    private get openDestinationSockets (): number {
+        let lingering = 0
+        for (const role of this.lingering.values()) {
+            if (role === 'destination') {
+                lingering++
+            }
+        }
+        return this.destinationSockets.size + this.pendingDestinations + lingering
     }
 
     private onDestinationConnected (socket: Socket, fd: number): void {
@@ -516,6 +551,12 @@ export class ETPortForwardHandler {
         const sourceToDestination = role === 'source'
 
         socket.on('data', (data: Buffer) => {
+            if (!this.isLive(role, socketId, socket)) {
+                // The tunnel is closed, so there is nobody to send this to. It
+                // still has to be read: a socket that is not drained never
+                // reports the local endpoint hanging up.
+                return
+            }
             for (let o = 0; o < data.length; o += PORT_FORWARD_CHUNK_SIZE) {
                 const sent = this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
                     sourceToDestination,
@@ -534,28 +575,52 @@ export class ETPortForwardHandler {
                     return
                 }
             }
+            if (this.congested()) {
+                // A paused socket fills the kernel's buffer, and that holds the
+                // application back the only way a byte stream can be. Nothing
+                // is lost, and nothing is queued that we would have to drop.
+                socket.pause()
+                this.throttled.add(socket)
+            }
         })
-        socket.on('end', () => {
-            this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
-                sourceToDestination, socketId, closed: true,
-            }))
-        })
-        socket.on('error', err => {
-            this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
-                sourceToDestination, socketId, error: err.message,
-            }))
+        socket.on('end', () => this.release(role, socketId, socket, { closed: true }))
+        socket.on('error', err => this.release(role, socketId, socket, { error: err.message }))
+        socket.on('close', () => {
+            this.lingering.delete(socket)
+            this.throttled.delete(socket)
             this.forget(role, socketId, socket)
         })
-        socket.on('close', () => this.forget(role, socketId, socket))
+    }
+
+    /** Is this socket still the registered end of its tunnel? */
+    private isLive (role: Role, socketId: number, socket: Socket): boolean {
+        return this.socketsFor(role).get(socketId) === socket
+    }
+
+    /**
+     * Our end of a tunnel is finished: unregister it and tell the peer, once.
+     *
+     * ET closes a tunnelled connection as a whole, and the peer forgets the
+     * socket id the moment it hears of it - or the moment it closes its own end.
+     * Anything sent for that id afterwards is at best an error in the peer's
+     * log and at worst lands in an unrelated connection that has since been
+     * given the same id. So nothing is sent for a socket that is no longer
+     * registered, whoever closed it.
+     */
+    private release (role: Role, socketId: number, socket: Socket, reason: { closed: true }|{ error: string }): void {
+        if (!this.isLive(role, socketId, socket)) {
+            return
+        }
+        this.forget(role, socketId, socket)
+        this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
+            sourceToDestination: role === 'source', socketId, ...reason,
+        }))
     }
 
     /** Tear a tunnelled connection down and tell the peer, best effort. */
     private closeForwardedSocket (role: Role, socketId: number, socket: Socket): void {
-        this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
-            sourceToDestination: role === 'source', socketId, closed: true,
-        }))
+        this.release(role, socketId, socket, { closed: true })
         socket.destroy()
-        this.forget(role, socketId, socket)
     }
 
     private socketsFor (role: Role): Map<number, Socket> {
@@ -626,8 +691,14 @@ export class ETPortForwardHandler {
             // Clean EOF. destroy() would discard the socket's writable buffer and
             // silently truncate the transfer whenever the local reader is slower
             // than the tunnel - a short file with no error anywhere. end() flushes
-            // what is queued, then closes.
+            // what is queued, then closes. Until the local endpoint hangs up
+            // too, the socket lingers: unregistered, but not forgotten.
             this.forget(role, data.socketId, socket)
+            this.lingering.set(socket, role)
+            // Whatever it still has to say goes nowhere, but it must be read for
+            // the socket to notice the local endpoint hanging up.
+            this.throttled.delete(socket)
+            socket.resume()
             socket.end()
             return
         }
@@ -661,9 +732,11 @@ export class ETPortForwardHandler {
             s.destroy()
         }
         this.pendingDestinationSockets.clear()
-        for (const s of [...this.sourceSockets.values(), ...this.destinationSockets.values()]) {
+        for (const s of [...this.sourceSockets.values(), ...this.destinationSockets.values(), ...this.lingering.keys()]) {
             s.destroy()
         }
+        this.lingering.clear()
+        this.throttled.clear()
         this.unassigned.clear()
         this.sourceSockets.clear()
         this.sourceSocketConfigs.clear()

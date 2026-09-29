@@ -11,6 +11,11 @@ const MAX_RANGE_PORTS = 1024
  * An empty address is NOT loopback: net.Server treats it as "all interfaces".
  */
 export function isLoopbackBindAddress (host: string): boolean {
+    // A forward written by hand may have no host at all, which net.Server
+    // treats exactly like an empty one.
+    if (typeof host !== 'string') {
+        return false
+    }
     const h = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
     return h === 'localhost'
         || h === '::1'

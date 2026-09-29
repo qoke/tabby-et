@@ -11,7 +11,7 @@ import { UnrecoverableSessionError } from './errors'
 import {
     CLIENT_SERVER_NONCE_MSB, CONNECT_TIMEOUT, ETConnectStatus, HANDSHAKE_TIMEOUT,
     MAX_HANDSHAKE_PROTO_LENGTH, MAX_PROTO_LENGTH, PROTOCOL_VERSION,
-    RECONNECT_INTERVAL, SERVER_CLIENT_NONCE_MSB,
+    RECONNECT_INTERVAL, SERVER_CLIENT_NONCE_MSB, WRITE_HIGH_WATER_MARK,
 } from './constants'
 import {
     decodeCatchupBuffer, decodeConnectResponse, decodeSequenceHeader,
@@ -40,12 +40,15 @@ export class ETClientConnection {
     get packet$ (): Observable<ETPacket> { return this.packetSubject }
     /** Emits once with a human-readable reason, then completes. */
     get ended$ (): Observable<string> { return this.endedSubject }
+    /** Emits when writers that held back because we were `congested` may carry on. */
+    get drained$ (): Observable<void> { return this.drainedSubject }
 
     state: ETConnectionState = 'connecting'
 
     private stateSubject = new Subject<ETConnectionState>()
     private packetSubject = new Subject<ETPacket>()
     private endedSubject = new Subject<string>()
+    private drainedSubject = new Subject<void>()
 
     private socket: Socket|null = null
     private byteReader: ByteReader|null = null
@@ -64,6 +67,12 @@ export class ETClientConnection {
      * needs this reference to tear them down.
      */
     private pendingHandshake: { socket: Socket, byteReader: ByteReader }|null = null
+    /**
+     * The socket whose TCP connect is still in flight, if any. It is older still
+     * than `pendingHandshake`: shutdown() needs it to abandon a connect that may
+     * otherwise sit in the kernel until CONNECT_TIMEOUT.
+     */
+    private connectingSocket: Socket|null = null
 
     constructor (
         private options: ETConnectionOptions,
@@ -90,16 +99,18 @@ export class ETClientConnection {
         try {
             socket = await this.openSocket()
             byteReader = new ByteReader(socket)
+            // shutdown() could not see this socket while it was connecting, so it
+            // has to be checked for here. Every later await is covered by
+            // pendingHandshake, but is re-checked all the same: nothing may be
+            // attached, and no state may be announced, once the session is over.
+            this.throwIfShutDown()
             // Published so shutdown() can reach the socket while the handshake is
             // still in flight - it is NOT reachable through this.socket yet.
             this.pendingHandshake = { socket, byteReader }
             const status = await this.sendConnectRequest(socket, byteReader)
+            this.throwIfShutDown()
 
-            if (status === ETConnectStatus.NEW_CLIENT) {
-                this.attach(socket, byteReader)
-                socket = null
-                byteReader = null
-            } else if (status === ETConnectStatus.RETURNING_CLIENT) {
+            if (status === ETConnectStatus.RETURNING_CLIENT) {
                 // A live session for our id still exists on the server (e.g. the
                 // protocol harness re-run, or a recovered tab racing a teardown).
                 // Run the recovery exchange; a fresh process cannot serve the
@@ -114,18 +125,14 @@ export class ETClientConnection {
                         + `orphaned etterminal on the remote host. Underlying error: ${err}`,
                     )
                 }
-                this.attach(socket, byteReader)
-                socket = null
-                byteReader = null
-            } else {
+            } else if (status !== ETConnectStatus.NEW_CLIENT) {
                 throw new Error(this.describeStatus(status))
             }
-            if (this.shuttingDown) { // eslint-disable-line @typescript-eslint/no-unnecessary-condition -- TS cannot see shutdown() reassign it across the await
-                // shutdown() raced the handshake. Attaching now would leave a live
-                // socket and a 'connected' state on a session the user already
-                // tore down; fail instead (the catch below destroys the socket).
-                throw new Error('Connection shut down during the handshake')
-            }
+            // Only now does the socket change hands. Up to this point the catch
+            // below owns it, so every failure above destroys it.
+            this.attach(socket, byteReader)
+            socket = null
+            byteReader = null
             this.setState('connected')
             this.runReadLoop()
         } catch (err) {
@@ -160,6 +167,17 @@ export class ETClientConnection {
         return written
     }
 
+    /**
+     * True while more is waiting to go out than it makes sense to add to.
+     *
+     * Packets are accepted regardless - writePacket() never blocks and terminal
+     * input must not be held up - but whoever is producing data in bulk should
+     * stop until drained$ says otherwise.
+     */
+    get congested (): boolean {
+        return !this.shuttingDown && this.writer.backlog >= WRITE_HIGH_WATER_MARK
+    }
+
     /** Deliberately drop the TCP connection to exercise recovery. */
     forceReconnect (): void {
         this.logger.info('Forcing an ET reconnect')
@@ -168,8 +186,10 @@ export class ETClientConnection {
 
     shutdown (): void {
         this.shuttingDown = true
-        // A handshake in flight owns a socket that shutdown() cannot see through
+        // An attempt in flight owns a socket that shutdown() cannot see through
         // this.socket - kill it explicitly, or it lingers until CONNECT_TIMEOUT.
+        this.connectingSocket?.destroy()
+        this.connectingSocket = null
         this.pendingHandshake?.socket.destroy()
         this.pendingHandshake?.byteReader.dispose()
         this.pendingHandshake = null
@@ -182,9 +202,20 @@ export class ETClientConnection {
         this.endedSubject.complete()
         this.packetSubject.complete()
         this.stateSubject.complete()
+        this.drainedSubject.complete()
     }
 
     // ---- internals --------------------------------------------------------
+
+    /**
+     * shutdown() can run during any await. Whatever resumes afterwards must stop
+     * here rather than attach a socket to a session that has already ended.
+     */
+    private throwIfShutDown (): void {
+        if (this.shuttingDown) {
+            throw new Error('Connection shut down during the handshake')
+        }
+    }
 
     private setState (state: ETConnectionState): void {
         if (this.state === state) {
@@ -201,6 +232,16 @@ export class ETClientConnection {
         this.writer.attach(socket)
         this.reader.attach(byteReader)
         this.reconnectAttempts = 0
+        socket.on('drain', () => {
+            if (this.socket === socket) {
+                this.drainedSubject.next()
+            }
+        })
+        // Whoever held back while there was no socket at all is waiting too.
+        // If the replay has left this one congested, its 'drain' will follow.
+        if (!this.congested) {
+            this.drainedSubject.next()
+        }
     }
 
     private openSocket (): Promise<Socket> {
@@ -208,28 +249,46 @@ export class ETClientConnection {
             const socket = new Socket()
             socket.setNoDelay(true)
             let settled = false
-            const fail = (err: Error) => {
+            const settle = (): boolean => {
                 if (settled) {
-                    return
+                    return false
                 }
                 settled = true
-                socket.destroy()
-                reject(err)
+                clearTimeout(timer)
+                socket.removeListener('error', fail)
+                socket.removeListener('close', onClose)
+                if (this.connectingSocket === socket) {
+                    this.connectingSocket = null
+                }
+                return true
             }
+            const fail = (err: Error) => {
+                if (settle()) {
+                    socket.destroy()
+                    reject(err)
+                }
+            }
+            // destroy() emits 'close' with no 'error', which is how shutdown()
+            // abandons a connect that is still in flight.
+            const onClose = () => fail(new Error(`Connection to ${this.options.host}:${this.options.port} closed while connecting`))
             const timer = setTimeout(
                 () => fail(new Error(`Timed out connecting to ${this.options.host}:${this.options.port}`)),
                 CONNECT_TIMEOUT,
             )
             socket.once('error', fail)
-            socket.connect(this.options.port, this.options.host, () => {
-                if (settled) {
-                    return
-                }
-                settled = true
-                clearTimeout(timer)
-                socket.removeListener('error', fail)
-                resolve(socket)
-            })
+            socket.once('close', onClose)
+            this.connectingSocket = socket
+            try {
+                socket.connect(this.options.port, this.options.host, () => {
+                    if (settle()) {
+                        resolve(socket)
+                    }
+                })
+            } catch (err) {
+                // connect() validates its arguments before it does anything
+                // else, and throws rather than emitting 'error'.
+                fail(err as Error)
+            }
         })
     }
 
@@ -347,8 +406,12 @@ export class ETClientConnection {
             try {
                 socket = await this.openSocket()
                 byteReader = new ByteReader(socket)
+                // As in connect(): shutdown() may have run during any of these
+                // awaits, and a session that has ended must never be resumed.
+                this.throwIfShutDown()
                 this.pendingHandshake = { socket, byteReader }
                 const status = await this.sendConnectRequest(socket, byteReader)
+                this.throwIfShutDown()
 
                 if (status === ETConnectStatus.INVALID_KEY) {
                     // The only way the client learns the remote shell has exited.
@@ -390,6 +453,10 @@ export class ETClientConnection {
                 return
             } catch (err) {
                 release()
+                // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- TS cannot see shutdown() reassign it across the awaits
+                if (this.shuttingDown) {
+                    return
+                }
                 this.logger.debug(`ET reconnect attempt ${this.reconnectAttempts} failed: ${err}`)
                 if (err instanceof UnrecoverableSessionError) {
                     // Retrying cannot fix this - the replay range is gone for
@@ -424,6 +491,7 @@ export class ETClientConnection {
         await this.writeProto(socket, encodeCatchupBuffer(toSend))
 
         const recovered = decodeCatchupBuffer(await this.readProto(byteReader))
+        this.throwIfShutDown()
 
         this.reader.revive(byteReader, recovered)
         this.writer.attach(socket)

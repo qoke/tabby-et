@@ -203,10 +203,10 @@ export function decodeFields (buf: Buffer): DecodedMessage {
             add(field, { wireType, bytes: buf.subarray(offset, offset + 8) })
             offset += 8
         } else if (wireType === WIRE_FIXED32) {
-            add(field, { wireType, bytes: buf.subarray(offset, offset + 4) })
             if (offset + 4 > buf.length) {
                 throw new Error('Truncated protobuf fixed32 field')
             }
+            add(field, { wireType, bytes: buf.subarray(offset, offset + 4) })
             offset += 4
         } else {
             throw new Error(`Unsupported protobuf wire type ${wireType}`)

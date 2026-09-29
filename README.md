@@ -26,11 +26,11 @@ TABBY_PLUGINS="$PWD" /path/to/patched/tabby --debug
 
 The [Patched Tabby preview workflow](https://github.com/qoke/tabby-et/actions/workflows/tabby-preview.yml) checks out `qoke/tabby` at `tabby-et-ssh-support`, runs the same typings and lint commands as Tabby's PR workflow, runs Tabby's normal macOS build and packaging commands, builds this plugin, and tests a copied app from each downloaded DMG on a Mac runner. Run it manually to select another branch or commit. Each successful run offers three downloadable artifacts for 30 days:
 
-- `tabby-macos-arm64-run-<run number>`: Apple Silicon DMG and ZIP.
-- `tabby-macos-x86_64-run-<run number>`: Intel DMG and ZIP.
+- `tabby-macos-arm64-run-<run ID>`: Apple Silicon DMG and ZIP.
+- `tabby-macos-x86_64-run-<run ID>`: Intel DMG and ZIP.
 - `tabby-et-plugin`: the locally built npm tarball.
 
-Use the Mac artifact from **this** workflow. The `qoke/tabby` Package-Build CI artifacts are unsigned and cannot be installed as these previews. Both workflows previously produced DMGs with the same filename; this preview now includes its GitHub Actions run number in the filename. Eject any old Tabby DMG volumes before mounting the new one. Download the artifact for your Mac, mount the DMG, and copy `Tabby.app` to a separate location so it does not replace your normal Tabby installation. Preview builds are signed ad hoc and verified in CI. They are **not signed with an Apple Developer ID or notarized**, so Gatekeeper rejects a downloaded copy; macOS may say the app is damaged. This is expected for this local preview, even when the app's signature is intact. [Apple explains that Gatekeeper normally accepts Developer ID signed apps](https://developer.apple.com/library/archive/technotes/tn2206/).
+Use the Mac artifact from **this** workflow. The `qoke/tabby` Package-Build CI artifacts are unsigned and cannot be installed as these previews. Both workflows previously produced DMGs with the same filename; this preview now includes its GitHub Actions run ID in the filename. That is the number in the run's URL, not the `#` counter shown beside its title. Eject any old Tabby DMG volumes before mounting the new one. Download the artifact for your Mac, mount the DMG, and copy `Tabby.app` to a separate location so it does not replace your normal Tabby installation. Preview builds are signed ad hoc and verified in CI. They are **not signed with an Apple Developer ID or notarized**, so Gatekeeper rejects a downloaded copy; macOS may say the app is damaged. This is expected for this local preview, even when the app's signature is intact. [Apple explains that Gatekeeper normally accepts Developer ID signed apps](https://developer.apple.com/library/archive/technotes/tn2206/).
 
 Verify the downloaded image and copied app:
 

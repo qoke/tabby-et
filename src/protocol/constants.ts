@@ -37,6 +37,16 @@ export const MAX_HANDSHAKE_PROTO_LENGTH = 4 * 1024
 export const MAX_BACKUP_BYTES = 64 * 1024 * 1024
 export const DISCONNECT_BUFFER_BYTES = 64 * 1024 * 1024
 
+/**
+ * How much may be waiting to go out before whoever is producing it is asked to
+ * hold on. The reference client gets this for free: its writes block. Ours
+ * never do, so without a limit a local application feeding a tunnel is read at
+ * memory speed, all of it is queued, and the replay buffer - which only keeps
+ * the newest MAX_BACKUP_BYTES - ends up trimming packets that have not even
+ * been sent yet. A reconnect after that cannot be recovered from.
+ */
+export const WRITE_HIGH_WATER_MARK = 4 * 1024 * 1024
+
 /** ET reads/writes the PTY in 16 KiB chunks. */
 export const TERMINAL_CHUNK_SIZE = 16 * 1024
 

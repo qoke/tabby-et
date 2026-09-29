@@ -1,6 +1,7 @@
 import { ByteReader } from './byteReader'
 import { ETCrypto } from './crypto'
 import { MAX_PROTO_LENGTH, PACKET_HEADER_SIZE } from './constants'
+import { PacketQueue } from './packetQueue'
 
 export interface ETPacket {
     header: number
@@ -12,7 +13,7 @@ export class BackedReader {
     sequenceNumber = 0
 
     /** Packets recovered during reconnect, still encrypted, oldest first. */
-    private localBuffer: Buffer[] = []
+    private localBuffer = new PacketQueue()
     private reader: ByteReader|null = null
 
     constructor (private crypto: ETCrypto) {}
@@ -31,7 +32,13 @@ export class BackedReader {
      */
     revive (reader: ByteReader, recovered: Buffer[]): void {
         this.reader = reader
-        this.localBuffer.push(...recovered)
+        // One at a time. A replay is as long as the outage was busy, and
+        // spreading it into a single call overflows the stack somewhere past a
+        // hundred thousand packets - on every attempt, so that the session
+        // could never be resumed at all.
+        for (const serialized of recovered) {
+            this.localBuffer.push(serialized)
+        }
         this.sequenceNumber += recovered.length
     }
 

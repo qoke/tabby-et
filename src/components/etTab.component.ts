@@ -1,5 +1,5 @@
 import { marker as _ } from '@biesbjerg/ngx-translate-extract-marker'
-import { Component, HostListener, Injector } from '@angular/core'
+import { Component, Injector } from '@angular/core'
 import { NgbModal } from '@ng-bootstrap/ng-bootstrap'
 import { ToastrService } from 'ngx-toastr'
 import stripAnsi from 'strip-ansi'
@@ -8,7 +8,7 @@ import { BaseTerminalTabComponent, ConnectableTerminalTabComponent } from 'tabby
 import { KeyboardInteractivePrompt, SSHProfile } from 'tabby-ssh'
 
 import { ETProfile } from '../api/interfaces'
-import { ETSession } from '../session/etSession'
+import { ETSession, ETSessionDestroyedError } from '../session/etSession'
 import { ETConnectionState } from '../protocol/connection'
 import { ETPortForwardingModalComponent } from './etPortForwardingModal.component'
 
@@ -63,6 +63,9 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
 
         const session = new ETSession(this.injector, this.profile)
         this.setSession(session)
+        // The previous session, if any, left the indicator on 'ended', and a new
+        // one reports nothing until it is connected.
+        this.connectionState = 'connecting'
 
         this.attachSessionHandler(session.serviceMessage$, msg => {
             this.showServiceToast(msg)
@@ -78,21 +81,46 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
         // look up and offer to save the password.
         this.attachSessionHandler(session.bootstrapSession$, s => {
             this.bootstrapProfile = s.profile
+            // A prompt is only worth showing while something waits for the
+            // answer. The bootstrap disconnects once it has the session key, or
+            // has failed, and the prompt goes with it.
+            this.attachSessionHandler(s.willDestroy$, () => {
+                this.activeKIPrompt = null
+            })
         })
 
         this.startSpinner(this.translate.instant(_('Connecting')))
         try {
             await session.start()
-            this.session?.resize(this.size.columns, this.size.rows)
+            session.resize(this.size.columns, this.size.rows)
         } catch (e) {
-            this.notifications.error(e.message, this.etNotificationTitle)
+            // A session that was destroyed while starting did not fail: the tab
+            // was closed, a new session was asked for, or the connection ended
+            // and has already said why.
+            if (!(e instanceof ETSessionDestroyedError)) {
+                this.notifications.error(e.message, this.etNotificationTitle)
+            }
             // A session that failed mid-start() never set open=true, so the tab's
             // close path would skip BaseSession.destroy() and leak its timers and
             // local port listeners. Tear it down here instead.
             await session.destroy().catch(() => { /* already down */ })
         } finally {
-            this.stopSpinner()
+            // "New session" starts the next attempt before this one has finished
+            // failing; by then the spinner belongs to that attempt.
+            if (!this.session || this.session === session) {
+                this.stopSpinner()
+            }
         }
+    }
+
+    async destroy (): Promise<void> {
+        const session = this.session
+        await super.destroy()
+        // Tabby destroys a session only once it is open. One that is still
+        // bootstrapping or connecting would carry on regardless and go live
+        // after its tab is gone, holding a connection to the remote session, a
+        // keepalive timer and the profile's local ports until Tabby exits.
+        await session?.destroy()
     }
 
     protected onSessionDestroyed (): void {
@@ -201,10 +229,5 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
         return super.isSessionExplicitlyTerminated()
             || this.recentInputs.charCodeAt(this.recentInputs.length - 1) === 4
             || this.recentInputs.endsWith('exit\r')
-    }
-
-    @HostListener('click')
-    onClick (): void {
-        this.activeKIPrompt = null
     }
 }
