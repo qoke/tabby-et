@@ -15,6 +15,9 @@ const { createSessionFixture } = require('./support/sessionFixture.cjs')
 const { load, createInjector, createProfile, startServer } = createSessionFixture()
 const { ETSession } = load('src/session/etSession.ts')
 const { ETClientConnection } = load('src/protocol/connection.ts')
+const { BackedWriter } = load('src/protocol/backedWriter.ts')
+const { ETCrypto } = load('src/protocol/crypto.ts')
+const { decodeTerminalBuffer } = load('src/protocol/messages.ts')
 const { ETPortForwardHandler } = load('src/session/portForwarding.ts')
 const { ETPacketType, WRITE_HIGH_WATER_MARK } = load('src/protocol/constants.ts')
 const {
@@ -205,6 +208,73 @@ test('an upload in progress survives an outage', async () => {
         assert.deepEqual(session.messages.filter(x => /Dropped/.test(x)), [])
     } finally {
         client.destroy()
+        await session.destroy()
+        await server.close()
+    }
+})
+
+test('the replay buffer keeps whatever the socket has not taken', () => {
+    const writer = new BackedWriter(new ETCrypto('RegressionTestPasskey00000000000', 0))
+    // A socket on a stalled link: it accepts everything and sends nothing.
+    const socket = {
+        writableLength: 0,
+        write (frame) {
+            this.writableLength += frame.length
+            return false
+        },
+    }
+    writer.attach(socket)
+    const megabyte = Buffer.alloc(MiB)
+    for (let i = 0; i < 80; i++) {
+        writer.write(ETPacketType.TERMINAL_BUFFER, megabyte)
+    }
+    // None of it has left this machine, so all of it has to be replayable. The
+    // newest 64 MiB alone would leave the server sixteen packets short.
+    writer.detach()
+    assert.equal(writer.recover(0).length, 80)
+
+    // Once the socket has taken it, the usual limit applies again.
+    socket.writableLength = 0
+    writer.attach(socket)
+    writer.write(ETPacketType.TERMINAL_BUFFER, megabyte)
+    writer.detach()
+    assert.throws(() => writer.recover(0), /already been trimmed/)
+    assert.equal(writer.recover(81 - 63).length, 63)
+})
+
+test('input queued behind a stalled link survives a reconnect', async () => {
+    const server = await startServer()
+    const session = new ETSession(createInjector(), createProfile(server.port))
+    session.messages = []
+    session.serviceMessage$.subscribe(message => session.messages.push(message))
+    try {
+        await session.start()
+        await waitFor(() => server.session?.socket, 'the server to attach')
+        server.session.socket.pause()
+
+        // A large paste, or a file sent with ZMODEM: Tabby feeds both to the
+        // session as fast as it can read them. One chunk more than the replay
+        // buffer keeps by size.
+        const input = crypto.randomBytes(4097 * 16 * 1024)
+        session.feedFromTerminal(input)
+        await settle(100)
+        server.dropConnection()
+
+        const received = () => server.received
+            .filter(x => x.header === ETPacketType.TERMINAL_BUFFER)
+            .reduce((total, x) => total + decodeTerminalBuffer(x.payload).length, 0)
+        await waitFor(() => received() === input.length || !session.open, 'the input to arrive', 60000)
+
+        assert.equal(session.open, true, session.messages.join(' / '))
+        assert.deepEqual(server.failures, [])
+        const hash = crypto.createHash('sha256')
+        for (const packet of server.received) {
+            if (packet.header === ETPacketType.TERMINAL_BUFFER) {
+                hash.update(decodeTerminalBuffer(packet.payload))
+            }
+        }
+        assert.equal(hash.digest('hex'), crypto.createHash('sha256').update(input).digest('hex'))
+    } finally {
         await session.destroy()
         await server.close()
     }

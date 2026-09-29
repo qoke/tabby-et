@@ -7,8 +7,11 @@
  * anything at all. Every option that ends up in a socket call or on a remote
  * command line is read through here first.
  *
- * Deliberately dependency-free, like redact.ts, so it is trivially testable.
+ * Deliberately free of runtime dependencies, like redact.ts, so it is trivially
+ * testable.
  */
+
+import type { ForwardedPortConfig } from 'tabby-ssh'
 
 /** Was this option left empty? */
 function isBlank (value: unknown): boolean {
@@ -65,4 +68,16 @@ export function resolveEnvironment (value: unknown): Record<string, string> {
         out[name] = String(raw)
     }
     return out
+}
+
+/**
+ * The profile's forwards. Anything other than a list means that there are
+ * none, and an entry that is not an object is not a forward. What each forward
+ * says is checked where it is used.
+ */
+export function resolveForwards (value: unknown): ForwardedPortConfig[] {
+    if (!Array.isArray(value)) {
+        return []
+    }
+    return value.filter(x => typeof x === 'object' && x !== null)
 }

@@ -237,3 +237,25 @@ test('a forward with no bind address is not mistaken for a private one', () => {
         assert.equal(isLoopbackBindAddress(host), true)
     }
 })
+
+test('a profile whose forwards are not a list still connects', async () => {
+    const forward = { type: 'Local', host: '127.0.0.1', port: 0, targetAddress: 'localhost', targetPort: 80 }
+    const cases = [
+        { forwardedPorts: null, listeners: 0 },
+        { forwardedPorts: undefined, listeners: 0 },
+        { forwardedPorts: 'nonsense', listeners: 0 },
+        { forwardedPorts: { 0: forward }, listeners: 0 },
+        { forwardedPorts: [null, 7, 'x', forward], listeners: 1 },
+    ]
+    for (const { forwardedPorts, listeners } of cases) {
+        const { server, session } = await setup({ forwardedPorts })
+        try {
+            await startOrFail(session, server)
+            assert.equal(session.open, true)
+            assert.equal(session.forwards.listeners.length, listeners)
+        } finally {
+            await session.destroy()
+            await server.close()
+        }
+    }
+})

@@ -8,21 +8,39 @@ import { PacketQueue } from './packetQueue'
 // crypto.ts can raise it too without a cycle (backedWriter already imports crypto).
 export { UnrecoverableSessionError } from './errors'
 
-/** Serialize a Packet: [encrypted=1][header][ciphertext]. */
-function serializePacket (header: number, encryptedPayload: Buffer): Buffer {
-    const out = Buffer.allocUnsafe(PACKET_HEADER_SIZE + encryptedPayload.length)
-    out[0] = 1
-    out[1] = header
-    encryptedPayload.copy(out, PACKET_HEADER_SIZE)
-    return out
+/** Framing B puts a 4-byte big-endian length in front of every serialized Packet. */
+const FRAME_PREFIX_SIZE = 4
+
+/**
+ * A packet as it goes on the wire: [length][encrypted=1][header][ciphertext].
+ * The length counts what follows it, not itself.
+ */
+function framePacket (header: number, encryptedPayload: Buffer): Buffer {
+    const length = PACKET_HEADER_SIZE + encryptedPayload.length
+    const frame = Buffer.allocUnsafe(FRAME_PREFIX_SIZE + length)
+    frame.writeInt32BE(length, 0)
+    frame[FRAME_PREFIX_SIZE] = 1
+    frame[FRAME_PREFIX_SIZE + 1] = header
+    encryptedPayload.copy(frame, FRAME_PREFIX_SIZE + PACKET_HEADER_SIZE)
+    return frame
+}
+
+/** The serialized Packet inside a frame, which is the form a catch-up carries. */
+function serializedPacket (frame: Buffer): Buffer {
+    return frame.subarray(FRAME_PREFIX_SIZE)
 }
 
 export class BackedWriter {
     /** Number of packets ever written, including while disconnected. */
     sequenceNumber = 0
 
-    /** Everything we may still have to replay, oldest first. */
+    /**
+     * Everything we may still have to replay, oldest first, as wire frames. A
+     * frame that is waiting on the socket is the very buffer that is kept here,
+     * so a backlog is held in memory once and not twice.
+     */
     private backupBuffer = new PacketQueue()
+    /** Serialized bytes in backupBuffer, which is how ET counts them. */
     private backupSize = 0
     private disconnectedBytes = 0
     private socket: Socket|null = null
@@ -52,8 +70,8 @@ export class BackedWriter {
         this.disconnectedBytes = 0
         // Nothing is trimmed while disconnected, so the newest `pending` entries
         // are exactly the packets in question. Oldest first.
-        for (const serialized of this.backupBuffer.newest(this.sequenceNumber - this.handedOff)) {
-            this.send(socket, serialized)
+        for (const frame of this.backupBuffer.newest(this.sequenceNumber - this.handedOff)) {
+            socket.write(frame)
         }
         this.handedOff = this.sequenceNumber
     }
@@ -90,32 +108,41 @@ export class BackedWriter {
             return false
         }
 
-        const serialized = serializePacket(header, this.crypto.encrypt(payload))
+        const frame = framePacket(header, this.crypto.encrypt(payload))
 
-        this.backupBuffer.push(serialized)
-        this.backupSize += serialized.length
+        this.backupBuffer.push(frame)
+        this.backupSize += serializedLength
         this.sequenceNumber++
 
-        // Only trim while connected - never discard data we may still have to replay.
-        while (this.socket && this.backupSize > MAX_BACKUP_BYTES) {
-            this.backupSize -= this.backupBuffer.shift()!.length
-        }
-
         if (!this.socket) {
-            this.disconnectedBytes += serialized.length
+            this.disconnectedBytes += serializedLength
             return true
         }
 
-        this.send(this.socket, serialized)
+        this.trim(this.socket)
+        this.socket.write(frame)
         this.handedOff = this.sequenceNumber
         return true
     }
 
-    private send (socket: Socket, serialized: Buffer): void {
-        const frame = Buffer.allocUnsafe(4 + serialized.length)
-        frame.writeInt32BE(serialized.length, 0) // BIG-endian, 4 bytes, excludes itself
-        serialized.copy(frame, 4)
-        socket.write(frame)
+    /**
+     * Forget the oldest packets, down to MAX_BACKUP_BYTES of those the socket
+     * has taken.
+     *
+     * Only while connected: nothing we may still have to replay is discarded.
+     * And never a packet that is still waiting on the socket. ET can trim by
+     * size alone because its writes block, so whatever it has written has at
+     * least reached the kernel. Ours queue without limit, and a packet that
+     * has not left this machine has certainly not reached the server, however
+     * much newer data is queued behind it. Trimming one would leave a hole that
+     * no reconnect could ever replay.
+     */
+    private trim (socket: Socket): void {
+        // Counts the frame prefixes too, which errs on the side of keeping.
+        const unsent = socket.writableLength || 0
+        while (this.backupSize - unsent > MAX_BACKUP_BYTES) {
+            this.backupSize -= serializedPacket(this.backupBuffer.shift()!).length
+        }
     }
 
     /** Packets the peer says it never received, oldest first. */
@@ -134,6 +161,6 @@ export class BackedWriter {
         // The catch-up carries everything written so far. Whatever is written
         // from here on is attach()'s to send.
         this.handedOff = this.sequenceNumber
-        return this.backupBuffer.newest(toRecover)
+        return this.backupBuffer.newest(toRecover).map(serializedPacket)
     }
 }

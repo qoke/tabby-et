@@ -37,6 +37,8 @@ export class ETBootstrap {
     private config: ConfigService
     private cancelled = false
     private rejectOnCancel: (err: Error) => void
+    /** Ends the capture that is in flight, if there is one, and its timeout with it. */
+    private abortCapture: ((err: Error) => void)|null = null
     /** Rejects when cancel() is called; every wait in run() races against it. */
     private cancellation = new Promise<never>((_, reject) => {
         this.rejectOnCancel = reject
@@ -66,7 +68,11 @@ export class ETBootstrap {
             return
         }
         this.cancelled = true
-        this.rejectOnCancel(new Error('The SSH bootstrap was cancelled'))
+        const reason = new Error('The SSH bootstrap was cancelled')
+        // run() is released by the race in any case. This is for the capture
+        // itself, which would otherwise sit on its timeout until it ran out.
+        this.abortCapture?.(reason)
+        this.rejectOnCancel(reason)
     }
 
     private orCancelled <T> (work: Promise<T>): Promise<T> {
@@ -162,6 +168,7 @@ export class ETBootstrap {
                     return
                 }
                 settled = true
+                this.abortCapture = null
                 if (timer) {
                     clearTimeout(timer)
                 }
@@ -171,6 +178,7 @@ export class ETBootstrap {
                     resolve({ stdout, stderr })
                 }
             }
+            this.abortCapture = finish
 
             timer = setTimeout(
                 () => finish(new Error('Timed out waiting for etterminal to start on the remote host')),
@@ -227,7 +235,12 @@ export class ETBootstrap {
     private async resolveSSHProfile (role: 'destination'|'jump'): Promise<SSHProfile> {
         const o = this.profile.options
         const linkedId = role === 'jump' ? o.jumpSshProfile : o.sshProfile
-        const host = role === 'jump' ? o.jumpHost! : o.host
+        // Read exactly as ETSession reads them for the probe and the ET
+        // connection. SSH must be asked for the host that those will use: the
+        // raw text would differ by its stray whitespace, which tabby-ssh trims
+        // for a direct connection but not for a proxy or for known hosts.
+        const host = resolveText(role === 'jump' ? o.jumpHost : o.host) ?? ''
+        const user = resolveText(o.user)
         const port = role === 'jump' ? o.jumpSshPort : o.sshPort
 
         if (linkedId) {
@@ -248,8 +261,8 @@ export class ETBootstrap {
             if (host) {
                 resolved.options.host = host
             }
-            if (o.user) {
-                resolved.options.user = o.user
+            if (user) {
+                resolved.options.user = user
             }
             return resolved
         }
@@ -257,7 +270,9 @@ export class ETBootstrap {
         const synthetic: PartialProfile<SSHProfile> = {
             type: 'ssh',
             name: `ET bootstrap for ${host}`,
-            options: { host, port, user: o.user },
+            // A blank user means "ask every time", which is tabby-ssh's to do.
+            // No user at all leaves it to the SSH defaults, as it always has.
+            options: { host, port, user: user ?? (typeof o.user === 'string' ? '' : undefined) },
         }
         // Route through the profile service so global SSH defaults still apply.
         return this.profiles.getConfigProxyForProfile<SSHProfile>(synthetic)

@@ -10,6 +10,7 @@ import {
     decodePortForwardDestinationResponse, encodePortForwardData,
     encodePortForwardDestinationRequest, encodePortForwardDestinationResponse,
 } from '../protocol/messages'
+import { resolveForwards } from './options'
 
 /** Returns false when the packet had to be dropped (the ET write buffer is full). */
 type Send = (header: number, payload: Buffer) => boolean
@@ -29,7 +30,14 @@ type Role = 'source'|'destination'
  * declared reverse tunnel.
  */
 const MAX_CONCURRENT_DESTINATION_SOCKETS = 256
-const MAX_PENDING_SOURCE_SOCKETS = 256
+/**
+ * The same ceiling for the sockets our own listeners accept, in whatever
+ * state: awaiting the peer, carrying data, or lingering. These are opened by
+ * local programs - or by anyone at all, for a forward that is bound to a
+ * network address - and each one costs a descriptor here and another in
+ * etserver, which serves every user of the host from the one process.
+ */
+const MAX_CONCURRENT_SOURCE_SOCKETS = 256
 const DESTINATION_RESPONSE_TIMEOUT = 30000
 
 /**
@@ -131,6 +139,8 @@ export class ETPortForwardHandler {
     private lingering = new Map<Socket, Role>()
     /** Sockets we have stopped reading from until the connection can take more. */
     private throttled = new Set<Socket>()
+    /** We are turning local connections away, and have said so. */
+    private refusing = false
     private disposed = false
     private nextToken = 1
     private nextSocketId = 1
@@ -155,7 +165,7 @@ export class ETPortForwardHandler {
     // ---- setup ------------------------------------------------------------
 
     async startLocalForwards (configs: ForwardedPortConfig[]): Promise<void> {
-        for (const config of configs.filter(x => x.type === PortForwardType.Local)) {
+        for (const config of resolveForwards(configs).filter(x => x.type === PortForwardType.Local)) {
             try {
                 await this.addLocalForward(config)
             } catch (err) {
@@ -238,7 +248,7 @@ export class ETPortForwardHandler {
         this.declaredReverseDestinations = []
         this.forgetActiveForwards(x => x.type === PortForwardType.Remote)
 
-        for (const config of options.forwardedPorts.filter(x => x.type === PortForwardType.Remote)) {
+        for (const config of resolveForwards(options.forwardedPorts).filter(x => x.type === PortForwardType.Remote)) {
             // A port outside 1-65535 cannot be declared as TCP, and declaring it
             // anyway would put an entry in the allow-list that no TCP request can
             // match - leaving the endpoint reachable only through the name branch.
@@ -294,11 +304,21 @@ export class ETPortForwardHandler {
             socket.destroy()
             return
         }
-        if (this.unassigned.size >= MAX_PENDING_SOURCE_SOCKETS) {
+        if (this.openSourceSockets >= MAX_CONCURRENT_SOURCE_SOCKETS) {
             socket.destroy()
-            this.logger.warn('Refused a forwarded connection: too many pending destination responses')
+            this.logger.warn('Refused a forwarded connection: too many are open already')
+            // A client that is turned away tends to try again at once, so this
+            // is said once for as long as it stays true.
+            if (!this.refusing) {
+                this.refusing = true
+                this.emitServiceMessage(
+                    `Too many forwarded connections are open (${MAX_CONCURRENT_SOURCE_SOCKETS}). `
+                    + 'Refusing new ones until some of them close.',
+                )
+            }
             return
         }
+        this.refusing = false
         const token = this.nextToken++
         // Pause until the peer assigns a socketId, otherwise early bytes are lost.
         socket.pause()
@@ -470,13 +490,22 @@ export class ETPortForwardHandler {
 
     /** Every socket the peer has had us open that is not closed yet, in any state. */
     private get openDestinationSockets (): number {
-        let lingering = 0
-        for (const role of this.lingering.values()) {
-            if (role === 'destination') {
-                lingering++
+        return this.destinationSockets.size + this.pendingDestinations + this.countLingering('destination')
+    }
+
+    /** Every socket our listeners have accepted that is not closed yet, in any state. */
+    private get openSourceSockets (): number {
+        return this.sourceSockets.size + this.unassigned.size + this.countLingering('source')
+    }
+
+    private countLingering (role: Role): number {
+        let count = 0
+        for (const lingering of this.lingering.values()) {
+            if (lingering === role) {
+                count++
             }
         }
-        return this.destinationSockets.size + this.pendingDestinations + lingering
+        return count
     }
 
     private onDestinationConnected (socket: Socket, fd: number): void {

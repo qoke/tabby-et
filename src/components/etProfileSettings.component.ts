@@ -25,6 +25,11 @@ export class ETProfileSettingsComponent implements ProfileSettingsComponent<ETPr
     ) { }
 
     async ngOnInit (): Promise<void> {
+        // A hand-edited profile can hold anything here. The Ports tab is hidden
+        // for as long as this is not a list, and adding to it would throw.
+        if (!Array.isArray(this.profile.options.forwardedPorts)) {
+            this.profile.options.forwardedPorts = []
+        }
         this.sshProfiles = (await this.profilesService.getProfiles({ includeBuiltin: false }))
             .filter(x => x.type === 'ssh' && x !== this.profile)
         this.sshProfiles.sort(firstBy(x => this.getSSHProfileLabel(x)))

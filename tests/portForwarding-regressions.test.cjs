@@ -10,7 +10,7 @@ const load = createLoader()
 const { ETPortForwardHandler } = load('src/session/portForwarding.ts')
 const { ETPacketType } = load('src/protocol/constants.ts')
 const {
-    decodePortForwardData, decodePortForwardDestinationResponse,
+    decodePortForwardData, decodePortForwardDestinationRequest, decodePortForwardDestinationResponse,
     encodePortForwardData, encodePortForwardDestinationRequest, encodePortForwardDestinationResponse,
 } = load('src/protocol/messages.ts')
 
@@ -193,5 +193,51 @@ test('lingering tunnels still count against the connection cap', async () => {
     } finally {
         handler.dispose()
         await service.close()
+    }
+})
+
+test('the connections a forward carries at once are capped', async () => {
+    // A peer that accepts every connection at once: nothing stays pending, so
+    // the cap on pending connections never comes into it.
+    const messages = []
+    const handler = new ETPortForwardHandler(createLogger(), (header, payload) => {
+        if (header === ETPacketType.PORT_FORWARD_DESTINATION_REQUEST) {
+            const request = decodePortForwardDestinationRequest(payload)
+            setImmediate(() => handler.handlePacket(ETPacketType.PORT_FORWARD_DESTINATION_RESPONSE,
+                encodePortForwardDestinationResponse({ clientFd: request.fd, socketId: 1000 + request.fd, hasError: false })))
+        }
+        return true
+    }, message => messages.push(message))
+    await handler.addLocalForward({ type: 'Local', host: '127.0.0.1', port: 0, targetAddress: 'localhost', targetPort: 80 })
+    const port = handler.listeners[0].server.address().port
+    const clients = []
+    const connect = () => {
+        const client = net.connect(port, '127.0.0.1')
+        client.on('error', () => {})
+        client.on('close', () => { client.refused = true })
+        clients.push(client)
+        return client
+    }
+    try {
+        for (let i = 0; i < 300; i++) {
+            connect()
+        }
+        await waitFor(() => clients.filter(x => x.refused).length === 44, 'the surplus connections to be refused')
+        await settle(50)
+        assert.equal(handler.sourceSockets.size, 256)
+        assert.equal(handler.unassigned.size, 0)
+        assert.equal(messages.filter(x => /too many/i.test(x)).length, 1, 'the refusals were not reported, or reported one by one')
+
+        // Room is made by connections ending, not by waiting.
+        clients.find(x => !x.refused).destroy()
+        await waitFor(() => handler.sourceSockets.size === 255, 'the closed connection to be released')
+        const late = connect()
+        await waitFor(() => handler.sourceSockets.size === 256, 'a new connection to be accepted')
+        assert.equal(late.refused, undefined)
+    } finally {
+        for (const client of clients) {
+            client.destroy()
+        }
+        handler.dispose()
     }
 })
