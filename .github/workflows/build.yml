@@ -1,0 +1,64 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run check:bundle
+      - run: npm test
+      - run: npm pack --dry-run --ignore-scripts
+
+  # The build compiles file by file and checks no types. This does, against
+  # the Tabby that the plugin is written for.
+  typecheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tabby-et
+      - name: Check out Tabby with SSH support
+        uses: actions/checkout@v4
+        with:
+          repository: qoke/tabby
+          ref: tabby-et-ssh-support
+          path: tabby
+          fetch-depth: 0
+      # Tabby names its version after the last release, which it finds by its tag.
+      - name: Fetch upstream release tags
+        working-directory: tabby
+        run: git fetch --force --tags https://github.com/Eugeny/tabby.git
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Tabby dependencies
+        working-directory: tabby
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libsecret-1-dev
+          npm i -g yarn
+          cd app
+          yarn
+          cd ..
+          rm app/node_modules/.yarn-integrity
+          yarn
+      - name: Build Tabby typings
+        working-directory: tabby
+        run: yarn run build:typings
+      - name: Install the plugin's dependencies
+        working-directory: tabby-et
+        run: npm ci
+      - name: Check the plugin against Tabby's types
+        working-directory: tabby-et
+        run: npm run typecheck
+        env:
+          TABBY_DIR: ${{ github.workspace }}/tabby

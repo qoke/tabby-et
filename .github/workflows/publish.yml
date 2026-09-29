@@ -1,0 +1,68 @@
+name: Publish to npm
+
+# Publishes with npm trusted publishing (OIDC). There is no npm token in this
+# repository: npm is told, in the settings of the package, to trust this
+# workflow of this repository, by its file name - publish.yml. Renaming this
+# file breaks publishing until npm is told the new name. See RELEASING.md.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  # Started by hand, it does everything but publish.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+      - name: Use an npm that can do trusted publishing
+        run: npm install --global npm@^11.5.1
+      - name: Check that the tag is the version in package.json
+        if: github.event_name == 'push'
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag is $GITHUB_REF_NAME, but package.json says $version"
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm run check:bundle
+      - name: Show what the package holds
+        run: npm pack --dry-run
+      - name: Decide whether to publish
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "$EVENT" != "push" ]; then
+            echo "Started by hand: nothing is published."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$(npm view "tabby-et@$version" version 2> /dev/null)" ]; then
+            echo "::notice::tabby-et@$version is on npm already; nothing is published."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish
+        if: steps.decide.outputs.publish == 'true'
+        run: npm publish --access public

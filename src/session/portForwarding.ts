@@ -1,0 +1,927 @@
+/* eslint-disable @typescript-eslint/no-unsafe-enum-comparison */
+import { createServer, isIP, Server, Socket } from 'net'
+import { Logger } from 'tabby-core'
+import { ForwardedPortConfig, PortForwardType } from 'tabby-ssh'
+
+import { ETProfileOptions } from '../api/interfaces'
+import { DEFAULT_ET_PORT, ETPacketType, PORT_FORWARD_CHUNK_SIZE } from '../protocol/constants'
+import {
+    PortForwardSourceRequest, decodePortForwardData, decodePortForwardDestinationRequest,
+    decodePortForwardDestinationResponse, encodePortForwardData,
+    encodePortForwardDestinationRequest, encodePortForwardDestinationResponse,
+} from '../protocol/messages'
+import { resolveFlag, resolveForwards, resolvePort } from './options'
+
+/**
+ * Returns false when the packet had to be dropped (the ET write buffer is full).
+ * `urgent` marks a control message: one that says a connection is over, or
+ * could not be made. Room is kept for those, because a peer that never hears
+ * of it keeps its end open.
+ */
+type Send = (header: number, payload: Buffer, urgent?: boolean) => boolean
+
+/**
+ * How long an attempt to reach the local end of a reverse tunnel may take, in
+ * ms. The reference gives each address three seconds. Without a limit, where
+ * what is sent to ::1 is dropped and not refused, it is the operating system
+ * that gives up, minutes later, before 127.0.0.1 is tried at all.
+ */
+export const DESTINATION_CONNECT_TIMEOUT = 3000
+
+/** What is known of the server that is to bind the reverse tunnels. */
+export interface ReverseTunnelServer {
+    /** It was reached over IPv6, so it has IPv6. */
+    ipv6: boolean
+}
+
+/**
+ * Which side of a tunnel we are for a given socket. The two roles have
+ * INDEPENDENT socketId namespaces - ours are allocated by `nextSocketId`, the
+ * peer's by the peer (upstream uses rand()) - so ids collide routinely and every
+ * lookup, insert and delete has to name its role.
+ */
+type Role = 'source'|'destination'
+
+/**
+ * Ceiling on sockets a peer can make us open at once. Every one of these is an
+ * inbound PORT_FORWARD_DESTINATION_REQUEST, i.e. peer-driven: without a cap a
+ * compromised etserver could exhaust our file descriptors through a single
+ * declared reverse tunnel.
+ */
+const MAX_CONCURRENT_DESTINATION_SOCKETS = 256
+/**
+ * The same ceiling for the sockets our own listeners accept, in whatever
+ * state: awaiting the peer, carrying data, or lingering. These are opened by
+ * local programs - or by anyone at all, for a forward that is bound to a
+ * network address - and each one costs a descriptor here and another in
+ * etserver, which serves every user of the host from the one process.
+ */
+const MAX_CONCURRENT_SOURCE_SOCKETS = 256
+const DESTINATION_RESPONSE_TIMEOUT = 30000
+
+/**
+ * How much data may sit queued for one local socket before we give up on it.
+ *
+ * The ET connection is a single multiplexed stream, so we cannot apply
+ * backpressure to the peer without stalling every other tunnel and the terminal
+ * as well. Bound the damage to the one socket that is not keeping up instead.
+ */
+const MAX_LOCAL_WRITE_BACKLOG = 8 * 1024 * 1024
+
+/**
+ * What a destination endpoint actually resolves to.
+ *
+ * `SocketEndpoint` carries both a name and a port, and the two are not mutually
+ * exclusive on the wire. Every decision about an endpoint - both the allow-list
+ * check and the connect that follows it - MUST go through resolveDestination()
+ * so that they cannot disagree about which field wins.
+ */
+type ResolvedDestination =
+    { kind: 'tcp', port: number }
+    | { kind: 'pipe', path: string }
+
+function isValidPort (port: number|undefined): port is number {
+    return port !== undefined && Number.isInteger(port) && port >= 1 && port <= 65535
+}
+
+/**
+ * The single rule for reading a destination endpoint.
+ *
+ * A usable port wins, exactly as upstream's createDestination does; otherwise a
+ * name means a Unix socket or named pipe. Anything else is malformed.
+ */
+function resolveDestination (target: { name?: string, port?: number }): ResolvedDestination|null {
+    if (isValidPort(target.port)) {
+        return { kind: 'tcp', port: target.port }
+    }
+    if (target.name) {
+        return { kind: 'pipe', path: target.name }
+    }
+    return null
+}
+
+interface SourceListener {
+    config: ForwardedPortConfig
+    server: Server
+}
+
+/**
+ * What is wrong with a local forward, if anything.
+ *
+ * The form checks what is typed into it, but a forward may never have been
+ * near the form: profiles are saved to a file, and read back as they are.
+ */
+function problemWithLocalForward (c: ForwardedPortConfig): string|null {
+    if (typeof c.host !== 'string') {
+        return `Invalid bind address "${String(c.host)}"`
+    }
+    if (typeof c.targetAddress !== 'string') {
+        return `Invalid target address "${String(c.targetAddress)}"`
+    }
+    // 0 is a port to listen on: it asks for any one that is free.
+    if (!Number.isInteger(c.port) || c.port < 0 || c.port > 65535) {
+        return `Invalid port "${String(c.port)}". Ports must be between 1 and 65535.`
+    }
+    if (!isValidPort(c.targetPort)) {
+        return `Invalid target port "${String(c.targetPort)}". Ports must be between 1 and 65535.`
+    }
+    return null
+}
+
+/**
+ * The address to ask etserver to bind a reverse tunnel to, or null if it is
+ * not one that can be relied on to resolve there.
+ *
+ * etserver does not report a bind address that it cannot resolve: it exits,
+ * and takes every session on the host with it. So only what needs no
+ * resolving is sent. An empty address is sent as localhost, which is what the
+ * reference client sends when it is given none; left out, it would mean every
+ * interface.
+ *
+ * An address with a zone, such as fe80::1%en0, is an address all the same, but
+ * not one that needs no resolving: the zone names an interface, and it is the
+ * server that has to have it.
+ */
+function reverseBindAddress (host: unknown): string|null {
+    if (typeof host !== 'string') {
+        return null
+    }
+    const address = host.trim().replace(/^\[(.*)\]$/, '$1')
+    if (!address || address.toLowerCase() === 'localhost') {
+        return 'localhost'
+    }
+    return isIP(address) && !address.includes('%') ? address : null
+}
+
+function describe (c: ForwardedPortConfig): string {
+    return c.type === PortForwardType.Local
+        ? `(local) ${c.host}:${c.port} -> (remote) localhost:${c.targetPort}`
+        // ET lands reverse-tunnel traffic on the CLIENT's localhost:port; the
+        // configured target address is ignored for TCP (PortForwardHandler::
+        // createDestination connects to ::1 / 127.0.0.1), so say so.
+        : `(remote) ${c.host}:${c.port} -> (local) localhost:${c.targetPort}`
+}
+
+function resolveAgentPath (): string|null {
+    // An explicitly configured agent wins everywhere - including on Windows,
+    // where Pageant/gpg-agent shims set SSH_AUTH_SOCK too. Only fall back to the
+    // stock OpenSSH pipe, which may or may not have an agent behind it; if it
+    // does not, the connect attempt fails and we answer with a destination error.
+    return process.env.SSH_AUTH_SOCK
+        ?? (process.platform === 'win32' ? '\\\\.\\pipe\\openssh-ssh-agent' : null)
+}
+
+export class ETPortForwardHandler {
+    /** Sockets we accepted locally, awaiting a socketId from the peer. Keyed by our token. */
+    private unassigned = new Map<number, { socket: Socket, config: ForwardedPortConfig, timer: ReturnType<typeof setTimeout> }>()
+    /** socketId -> local socket, for tunnels where WE are the source. */
+    private sourceSockets = new Map<number, Socket>()
+    /** Which declared forward each source socket belongs to (for live removal). */
+    private sourceSocketConfigs = new Map<number, ForwardedPortConfig>()
+    /** socketId -> local socket, for tunnels where WE are the destination. */
+    private destinationSockets = new Map<number, Socket>()
+    private listeners: SourceListener[] = []
+    /**
+     * Destinations we declared in INITIAL_PAYLOAD. Inbound
+     * PORT_FORWARD_DESTINATION_REQUEST packets make us open sockets, so every one
+     * of them is checked against this list: a malicious etserver must not be able
+     * to pivot us at arbitrary local or intranet ports (see §17.4).
+     */
+    private declaredReverseDestinations: ResolvedDestination[] = []
+    /**
+     * Forwards this SESSION currently has, for the runtime port-forwarding UI.
+     * Stable array identity: mutated in place, never reassigned, so an Angular
+     * template can bind straight to it.
+     */
+    readonly activeForwards: ForwardedPortConfig[] = []
+    /** Destination sockets that are connecting but not yet in destinationSockets. */
+    private pendingDestinations = 0
+    private pendingDestinationSockets = new Set<Socket>()
+    /**
+     * Sockets whose tunnel is closed, by either end, that have not closed yet
+     * themselves: they are still delivering what was queued for the local
+     * endpoint, or waiting for it to hang up. They are in neither socket map -
+     * the peer has forgotten their ids and may hand them out again - but they
+     * are open file descriptors all the same, and stay ours to account for and
+     * to close.
+     */
+    private lingering = new Map<Socket, Role>()
+    /** Sockets we have stopped reading from until the connection can take more. */
+    private throttled = new Set<Socket>()
+    /** We are turning local connections away, and have said so. */
+    private refusing = false
+    private disposed = false
+    private nextToken = 1
+    private nextSocketId = 1
+
+    constructor (
+        private logger: Logger,
+        private send: Send,
+        private emitServiceMessage: (msg: string) => void,
+        /** Is more waiting to go out than the connection can sensibly hold? */
+        private congested: () => boolean = () => false,
+    ) {}
+
+    /** The connection can take more: let the tunnels that were held back read on. */
+    resume (): void {
+        const held = [...this.throttled]
+        this.throttled.clear()
+        for (const socket of held) {
+            socket.resume()
+        }
+    }
+
+    // ---- setup ------------------------------------------------------------
+
+    async startLocalForwards (configs: ForwardedPortConfig[]): Promise<void> {
+        for (const config of resolveForwards(configs).filter(x => x.type === PortForwardType.Local)) {
+            try {
+                await this.addLocalForward(config)
+            } catch (err) {
+                this.emitServiceMessage(`Failed to forward ${describe(config)}: ${err}`)
+            }
+        }
+    }
+
+    addLocalForward (config: ForwardedPortConfig): Promise<void> {
+        return new Promise((resolve, reject) => {
+            if (this.disposed) {
+                reject(new Error('Session has ended'))
+                return
+            }
+            const problem = problemWithLocalForward(config)
+            if (problem) {
+                reject(new Error(problem))
+                return
+            }
+            const server = createServer(socket => this.onLocalConnection(config, socket))
+            const onListenError = (err: Error) => reject(err)
+            server.once('error', onListenError)
+            server.listen(config.port, config.host, () => {
+                server.removeListener('error', onListenError)
+                if (this.disposed) {
+                    server.close()
+                    reject(new Error('Session has ended'))
+                    return
+                }
+                // A net.Server with no 'error' listener THROWS on any later error
+                // (EMFILE while accepting, for one), which would take the whole
+                // renderer down. Keep one attached for the listener's lifetime,
+                // and report only the first - the rest are noise from the teardown.
+                let reported = false
+                server.on('error', err => {
+                    if (reported) {
+                        return
+                    }
+                    reported = true
+                    this.emitServiceMessage(`Port forward ${describe(config)} failed: ${err.message}`)
+                    this.removeForward(config)
+                })
+                this.listeners.push({ config, server })
+                this.activeForwards.push(config)
+                this.emitServiceMessage(`Forwarding ${describe(config)}`)
+                resolve()
+            })
+        })
+    }
+
+    removeForward (config: ForwardedPortConfig): void {
+        const index = this.listeners.findIndex(x => x.config === config)
+        if (index >= 0) {
+            this.listeners[index].server.close()
+            this.listeners.splice(index, 1)
+            this.forgetActiveForwards(x => x === config)
+            // The forward no longer exists from the user's point of view, so its
+            // live tunnelled connections go too - at both ends. The peer only
+            // closes its half when told to, and would otherwise keep a
+            // connection to the remote service open for as long as the session
+            // lasts.
+            for (const [socketId, owned] of [...this.sourceSocketConfigs]) {
+                const socket = this.sourceSockets.get(socketId)
+                if (owned === config && socket) {
+                    this.closeForwardedSocket('source', socketId, socket)
+                }
+            }
+            for (const [token, entry] of this.unassigned) {
+                if (entry.config === config) {
+                    clearTimeout(entry.timer)
+                    entry.socket.destroy()
+                    this.unassigned.delete(token)
+                }
+            }
+            this.emitServiceMessage(`Stopped forwarding ${describe(config)}`)
+        }
+    }
+
+    /**
+     * Reverse tunnels are declared in InitialPayload, not created at runtime.
+     * Agent forwarding is just a reverse tunnel with an environment variable and NO source.
+     */
+    buildReverseTunnelRequests (
+        options: ETProfileOptions, server: ReverseTunnelServer = { ipv6: false },
+    ): PortForwardSourceRequest[] {
+        const requests: PortForwardSourceRequest[] = []
+        this.declaredReverseDestinations = []
+        this.forgetActiveForwards(x => x.type === PortForwardType.Remote)
+        // etserver keeps one table of the ports it listens on, for all of its
+        // sessions and for itself, and aborts when it is asked for one that is
+        // in it. Two of those cases can be seen from here, and are not sent.
+        // The third - a port that another session holds - cannot.
+        const serverPort = resolvePort(options.port, DEFAULT_ET_PORT, 'etserver port')
+        const requested = new Set<number>()
+
+        for (const config of resolveForwards(options.forwardedPorts).filter(x => x.type === PortForwardType.Remote)) {
+            const skip = (reason: string) => this.emitServiceMessage(
+                `Skipping the reverse tunnel ${String(config.host)}:${config.port} -> localhost:${config.targetPort}: ${reason}`,
+            )
+            // A port outside 1-65535 cannot be declared as TCP, and declaring it
+            // anyway would put an entry in the allow-list that no TCP request can
+            // match - leaving the endpoint reachable only through the name branch.
+            // Refuse the whole tunnel instead.
+            if (!isValidPort(config.port) || !isValidPort(config.targetPort)) {
+                skip('both ports must be between 1 and 65535.')
+                continue
+            }
+            if (typeof config.targetAddress !== 'string') {
+                skip('the target address is not text.')
+                continue
+            }
+            const bindAddress = reverseBindAddress(config.host)
+            if (!bindAddress) {
+                skip('the bind address must be an IP address without a zone, or localhost.')
+                continue
+            }
+            if (isIP(bindAddress) === 6 && !server.ipv6) {
+                // Asked for an IPv6 address alone, an etserver that cannot
+                // have one does not refuse: it finds nothing to listen on,
+                // and aborts. Whether it can is only known of a server that
+                // was reached over IPv6.
+                skip('an IPv6 bind address is only asked of a server that was reached over IPv6. '
+                    + 'Use localhost or an IPv4 address, or connect to the server by its IPv6 address.')
+                continue
+            }
+            if (config.port === serverPort) {
+                skip(`port ${config.port} is the one etserver itself listens on.`)
+                continue
+            }
+            if (requested.has(config.port)) {
+                skip(`port ${config.port} is already asked for by another tunnel of this profile.`)
+                continue
+            }
+            requested.add(config.port)
+            requests.push({
+                source: { name: bindAddress, port: config.port },
+                destination: { name: config.targetAddress, port: config.targetPort },
+            })
+            this.declaredReverseDestinations.push({ kind: 'tcp', port: config.targetPort })
+            this.activeForwards.push(config)
+        }
+
+        if (resolveFlag(options.forwardAgent)) {
+            const authSock = resolveAgentPath()
+            if (!authSock) {
+                this.emitServiceMessage(
+                    'Agent forwarding is enabled but no SSH agent was found; skipping it',
+                )
+            } else {
+                // NOTE: source MUST be omitted here - etserver rejects a request that has
+                // both a source and an environment variable.
+                requests.push({
+                    destination: { name: authSock },
+                    environmentVariable: 'SSH_AUTH_SOCK',
+                })
+                this.declaredReverseDestinations.push({ kind: 'pipe', path: authSock })
+            }
+        }
+
+        return requests
+    }
+
+    /** Drop matching entries from activeForwards in place, preserving array identity. */
+    private forgetActiveForwards (predicate: (c: ForwardedPortConfig) => boolean): void {
+        for (let i = this.activeForwards.length - 1; i >= 0; i--) {
+            if (predicate(this.activeForwards[i])) {
+                this.activeForwards.splice(i, 1)
+            }
+        }
+    }
+
+    // ---- we are the SOURCE ------------------------------------------------
+
+    private onLocalConnection (config: ForwardedPortConfig, socket: Socket): void {
+        if (this.disposed) {
+            socket.destroy()
+            return
+        }
+        if (this.openSourceSockets >= MAX_CONCURRENT_SOURCE_SOCKETS) {
+            socket.destroy()
+            this.logger.warn('Refused a forwarded connection: too many are open already')
+            // A client that is turned away tends to try again at once, so this
+            // is said once for as long as it stays true.
+            if (!this.refusing) {
+                this.refusing = true
+                this.emitServiceMessage(
+                    `Too many forwarded connections are open (${MAX_CONCURRENT_SOURCE_SOCKETS}). `
+                    + 'Refusing new ones until some of them close.',
+                )
+            }
+            return
+        }
+        this.refusing = false
+        const token = this.nextToken++
+        // Pause until the peer assigns a socketId, otherwise early bytes are lost.
+        socket.pause()
+        const timer = setTimeout(() => {
+            this.unassigned.delete(token)
+            socket.destroy()
+            this.emitServiceMessage('Timed out opening a forwarded connection')
+        }, DESTINATION_RESPONSE_TIMEOUT)
+        this.unassigned.set(token, { socket, config, timer })
+
+        socket.once('error', () => {
+            socket.destroy()
+        })
+        socket.once('close', () => {
+            clearTimeout(timer)
+            this.unassigned.delete(token)
+        })
+
+        const sent = this.send(ETPacketType.PORT_FORWARD_DESTINATION_REQUEST, encodePortForwardDestinationRequest({
+            // ET ignores the destination name for TCP and connects to the remote
+            // localhost, but we send it anyway for forward compatibility.
+            destination: { name: config.targetAddress, port: config.targetPort },
+            fd: token,
+        }))
+        if (!sent) {
+            this.unassigned.delete(token)
+            clearTimeout(timer)
+            socket.destroy()
+            this.emitServiceMessage('Dropped a forwarded connection: the ET write buffer is full')
+        }
+    }
+
+    private onDestinationResponse (payload: Buffer): void {
+        const response = decodePortForwardDestinationResponse(payload)
+        const token = response.clientFd ?? -1
+        const entry = this.unassigned.get(token)
+        this.unassigned.delete(token)
+
+        if (!entry) {
+            this.logger.warn(`Destination response for an unknown token ${token}`)
+            // The local client may have timed out or closed while the peer was
+            // connecting. Release the peer's new socket if its id is not already
+            // in use by another live source connection.
+            if (!response.hasError && response.socketId !== undefined && !this.sourceSockets.has(response.socketId)) {
+                this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
+                    sourceToDestination: true, socketId: response.socketId, closed: true,
+                }), true)
+            }
+            return
+        }
+        clearTimeout(entry.timer)
+        if (response.hasError) {
+            this.emitServiceMessage(`Remote refused a forwarded connection: ${response.error}`)
+            entry.socket.destroy()
+            return
+        }
+        if (response.socketId === undefined) {
+            // Without a socketId we could not route PF_DATA for this socket;
+            // writing one with the field omitted would corrupt the peer's maps.
+            this.logger.warn('Destination response without a socket id; dropping the connection')
+            entry.socket.destroy()
+            return
+        }
+
+        const socketId = response.socketId
+        const previous = this.sourceSockets.get(socketId)
+        if (previous) {
+            // socketIds are allocated by the peer (upstream uses rand()), so treat
+            // a collision as "the peer considers the old one dead". Destroy it
+            // BEFORE registering the replacement: destroy() emits 'close'
+            // asynchronously, and forget() is identity-checked precisely so that
+            // late 'close' cannot evict the socket that took its id.
+            previous.destroy()
+        }
+        this.sourceSockets.set(socketId, entry.socket)
+        this.sourceSocketConfigs.set(socketId, entry.config)
+        this.pipeSocket(entry.socket, socketId, 'source')
+        entry.socket.resume()
+    }
+
+    // ---- we are the DESTINATION -------------------------------------------
+
+    private onDestinationRequest (payload: Buffer): void {
+        const request = decodePortForwardDestinationRequest(payload)
+        // Resolve FIRST, then check the resolved endpoint, then act on that same
+        // resolved endpoint. The check and the connect must never re-read the raw
+        // fields independently: a request naming the declared agent socket AND a
+        // port used to pass the name-based check and then get connected as TCP,
+        // turning any declared reverse tunnel into an arbitrary localhost pivot.
+        const resolved = resolveDestination(request.destination)
+
+        if (!resolved) {
+            this.sendDestinationError(request.fd, new Error('Malformed port forward destination'))
+            return
+        }
+
+        if (!this.isDeclaredReverseDestination(resolved)) {
+            this.logger.warn('Rejected a port-forward destination that was not declared for this session')
+            this.sendDestinationError(request.fd, new Error('Destination was not declared for this session'))
+            return
+        }
+
+        if (this.openDestinationSockets >= MAX_CONCURRENT_DESTINATION_SOCKETS) {
+            this.logger.warn('Refused a port-forward destination: too many concurrent forwarded connections')
+            this.sendDestinationError(request.fd, new Error('Too many concurrent forwarded connections'))
+            return
+        }
+        this.pendingDestinations++
+        // Exactly one of these runs, exactly once, so the pending count is always
+        // released - including on the malformed-destination path below.
+        let settled = false
+        const connected = (socket: Socket) => {
+            if (settled) {
+                socket.destroy()
+                return
+            }
+            settled = true
+            if (this.disposed) {
+                socket.destroy()
+                return
+            }
+            this.pendingDestinations--
+            this.onDestinationConnected(socket, request.fd)
+        }
+        const failed = (err: Error) => {
+            if (settled) {
+                return
+            }
+            settled = true
+            if (this.disposed) {
+                return
+            }
+            this.pendingDestinations--
+            this.sendDestinationError(request.fd, err)
+        }
+
+        if (resolved.kind === 'tcp') {
+            // Upstream always connects TCP destinations to the connecting side's
+            // own localhost (::1, then 127.0.0.1) and ignores destination.name -
+            // including on the client side for reverse tunnels. Mirror that.
+            this.connectLocalhost(resolved.port, connected, failed)
+        } else {
+            // Unix socket path, or a Windows named pipe for agent forwarding.
+            const socket = new Socket()
+            this.pendingDestinationSockets.add(socket)
+            socket.setNoDelay(true)
+            const onConnectError = (err: Error) => {
+                this.pendingDestinationSockets.delete(socket)
+                socket.destroy()
+                failed(err)
+            }
+            socket.once('error', onConnectError)
+            try {
+                socket.connect(resolved.path, () => {
+                    this.pendingDestinationSockets.delete(socket)
+                    // Hand the socket over cleanly: pipeSocket installs its own error
+                    // handling, and leaving this one attached would answer a mid-stream
+                    // error with a second DESTINATION_RESPONSE for the same fd.
+                    socket.removeListener('error', onConnectError)
+                    connected(socket)
+                })
+            } catch (err) {
+                this.pendingDestinationSockets.delete(socket)
+                socket.destroy()
+                failed(err as Error)
+            }
+        }
+    }
+
+    /** Every socket the peer has had us open that is not closed yet, in any state. */
+    private get openDestinationSockets (): number {
+        return this.destinationSockets.size + this.pendingDestinations + this.countLingering('destination')
+    }
+
+    /** Every socket our listeners have accepted that is not closed yet, in any state. */
+    private get openSourceSockets (): number {
+        return this.sourceSockets.size + this.unassigned.size + this.countLingering('source')
+    }
+
+    private countLingering (role: Role): number {
+        let count = 0
+        for (const lingering of this.lingering.values()) {
+            if (lingering === role) {
+                count++
+            }
+        }
+        return count
+    }
+
+    private onDestinationConnected (socket: Socket, fd: number): void {
+        const socketId = this.nextSocketId++
+        if (!this.send(
+            ETPacketType.PORT_FORWARD_DESTINATION_RESPONSE,
+            encodePortForwardDestinationResponse({ clientFd: fd, socketId, hasError: false }),
+            true,
+        )) {
+            socket.destroy()
+            return
+        }
+        this.destinationSockets.set(socketId, socket)
+        this.pipeSocket(socket, socketId, 'destination')
+    }
+
+    private sendDestinationError (fd: number, err: Error): void {
+        this.send(
+            ETPacketType.PORT_FORWARD_DESTINATION_RESPONSE,
+            encodePortForwardDestinationResponse({ clientFd: fd, hasError: true, error: err.message }),
+            true,
+        )
+    }
+
+    /** ::1 first, then 127.0.0.1 - a fresh socket per attempt, matching upstream. */
+    private connectLocalhost (port: number, onConnect: (socket: Socket) => void, onError: (err: Error) => void): void {
+        const hosts = ['::1', '127.0.0.1']
+        const attempt = (index: number): void => {
+            const socket = new Socket()
+            this.pendingDestinationSockets.add(socket)
+            socket.setNoDelay(true)
+            let settled = false
+            const fail = (err: Error) => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                clearTimeout(timer)
+                this.pendingDestinationSockets.delete(socket)
+                socket.destroy()
+                if (!this.disposed && index + 1 < hosts.length) {
+                    attempt(index + 1)
+                } else {
+                    onError(err)
+                }
+            }
+            const timer: any = setTimeout(
+                () => fail(new Error(`Timed out connecting to ${hosts[index]} port ${port}`)),
+                DESTINATION_CONNECT_TIMEOUT,
+            )
+            timer.unref?.()
+            socket.once('error', fail)
+            // dispose() destroys what is pending, which says so with a 'close'
+            // and no 'error'.
+            socket.once('close', () => fail(new Error('Session has ended')))
+            socket.connect(port, hosts[index], () => {
+                if (settled) {
+                    return
+                }
+                settled = true
+                clearTimeout(timer)
+                this.pendingDestinationSockets.delete(socket)
+                socket.removeListener('error', fail)
+                socket.removeAllListeners('close')
+                onConnect(socket)
+            })
+        }
+        attempt(0)
+    }
+
+    /**
+     * A destination request is only honoured when it matches something we declared
+     * in INITIAL_PAYLOAD, compared as the SAME resolved kind.
+     *
+     * Matching kind-for-kind is what closes the bypass: a TCP request can only ever
+     * be satisfied by a TCP entry (matched on port - the name is not authoritative
+     * for TCP and older servers may not echo it), and a pipe request only by a pipe
+     * entry (matched on path). An endpoint carrying both fields can no longer be
+     * validated as one kind and connected as the other.
+     */
+    private isDeclaredReverseDestination (resolved: ResolvedDestination): boolean {
+        return this.declaredReverseDestinations.some(d =>
+            d.kind === 'tcp'
+                ? resolved.kind === 'tcp' && d.port === resolved.port
+                : resolved.kind === 'pipe' && d.path === resolved.path,
+        )
+    }
+
+    // ---- shared plumbing --------------------------------------------------
+
+    private pipeSocket (socket: Socket, socketId: number, role: Role): void {
+        // The wire flag is about direction of travel, not about our role: data we
+        // send as the source travels source -> destination.
+        const sourceToDestination = role === 'source'
+
+        socket.on('data', (data: Buffer) => {
+            if (!this.isLive(role, socketId, socket)) {
+                // The tunnel is closed, so there is nobody to send this to. It
+                // still has to be read: a socket that is not drained never
+                // reports the local endpoint hanging up.
+                return
+            }
+            for (let o = 0; o < data.length; o += PORT_FORWARD_CHUNK_SIZE) {
+                const sent = this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
+                    sourceToDestination,
+                    socketId,
+                    buffer: data.subarray(o, o + PORT_FORWARD_CHUNK_SIZE),
+                }))
+                if (!sent) {
+                    // Unlike terminal input, a forwarded stream is a reliable byte
+                    // stream: silently skipping a packet hands the peer a hole it
+                    // can never detect. Fail the connection instead, so the local
+                    // application sees a reset rather than corrupt data.
+                    this.emitServiceMessage(
+                        'Dropped a forwarded connection: the ET write buffer is full',
+                    )
+                    this.closeForwardedSocket(role, socketId, socket)
+                    return
+                }
+            }
+            if (this.congested()) {
+                // A paused socket fills the kernel's buffer, and that holds the
+                // application back the only way a byte stream can be. Nothing
+                // is lost, and nothing is queued that we would have to drop.
+                socket.pause()
+                this.throttled.add(socket)
+            }
+        })
+        socket.on('end', () => this.release(role, socketId, socket, { closed: true }))
+        socket.on('error', err => this.release(role, socketId, socket, { error: err.message }))
+        socket.on('close', () => {
+            this.lingering.delete(socket)
+            this.throttled.delete(socket)
+            this.forget(role, socketId, socket)
+        })
+    }
+
+    /** Is this socket still the registered end of its tunnel? */
+    private isLive (role: Role, socketId: number, socket: Socket): boolean {
+        return this.socketsFor(role).get(socketId) === socket
+    }
+
+    /**
+     * Our end of a tunnel is finished: unregister it and tell the peer, once.
+     *
+     * ET closes a tunnelled connection as a whole, and the peer forgets the
+     * socket id the moment it hears of it - or the moment it closes its own end.
+     * Anything sent for that id afterwards is at best an error in the peer's
+     * log and at worst lands in an unrelated connection that has since been
+     * given the same id. So nothing is sent for a socket that is no longer
+     * registered, whoever closed it.
+     */
+    private release (role: Role, socketId: number, socket: Socket, reason: { closed: true }|{ error: string }): void {
+        if (!this.isLive(role, socketId, socket)) {
+            return
+        }
+        this.forget(role, socketId, socket)
+        // Until 'close'. A local endpoint that has finished sending may be a
+        // long way from having read what is queued for it.
+        this.lingering.set(socket, role)
+        const told = this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
+            sourceToDestination: role === 'source', socketId, ...reason,
+        }), true)
+        if (!told) {
+            this.logger.warn(`Could not tell the peer that forwarded socket ${socketId} is closed`)
+        }
+    }
+
+    /** Tear a tunnelled connection down and tell the peer, best effort. */
+    private closeForwardedSocket (role: Role, socketId: number, socket: Socket): void {
+        this.release(role, socketId, socket, { closed: true })
+        socket.destroy()
+    }
+
+    private socketsFor (role: Role): Map<number, Socket> {
+        return role === 'source' ? this.sourceSockets : this.destinationSockets
+    }
+
+    /**
+     * Unregister a socket from ITS OWN role's map only.
+     *
+     * Both the role and the socket identity matter. The two maps are separate id
+     * namespaces, so deleting `socketId` from both would evict an unrelated live
+     * connection that happens to share the number; and a destroyed socket's
+     * 'close' arrives a tick late, so without the identity check it would evict
+     * the replacement that already took its id.
+     */
+    private forget (role: Role, socketId: number, socket: Socket): void {
+        const map = this.socketsFor(role)
+        if (map.get(socketId) !== socket) {
+            return
+        }
+        map.delete(socketId)
+        if (role === 'source') {
+            this.sourceSocketConfigs.delete(socketId)
+        }
+    }
+
+    handlePacket (header: number, payload: Buffer): void {
+        if (this.disposed) {
+            return
+        }
+        // A malformed packet must never throw out of here: ETSession treats a
+        // throw as a socket failure and would churn the connection. Drop it and
+        // carry on; a genuine crypto desync still fails inside BackedReader.
+        try {
+            this.handlePacketInner(header, payload)
+        } catch (err) {
+            this.logger.warn(`Dropping malformed port-forward packet (header ${header}): ${err}`)
+        }
+    }
+
+    private handlePacketInner (header: number, payload: Buffer): void {
+        if (header === ETPacketType.PORT_FORWARD_DESTINATION_REQUEST) {
+            this.onDestinationRequest(payload)
+            return
+        }
+        if (header === ETPacketType.PORT_FORWARD_DESTINATION_RESPONSE) {
+            this.onDestinationResponse(payload)
+            return
+        }
+        // PORT_FORWARD_DATA
+        const data = decodePortForwardData(payload)
+        // sourceToDestination=true means "for whoever is the destination", i.e. us when
+        // the peer is the source. The two maps keep the roles apart.
+        const role: Role = data.sourceToDestination ? 'destination' : 'source'
+        const socket = this.socketsFor(role).get(data.socketId)
+        if (!socket) {
+            this.logger.debug(`Data for a closed forwarded socket ${data.socketId}`)
+            return
+        }
+        if (data.error !== undefined) {
+            // The far side failed mid-stream. Whatever is still queued locally is
+            // part of a stream we know to be broken, so dropping it is correct.
+            socket.destroy()
+            this.forget(role, data.socketId, socket)
+            return
+        }
+        if (data.closed !== undefined) {
+            // Clean EOF. destroy() would discard the socket's writable buffer and
+            // silently truncate the transfer whenever the local reader is slower
+            // than the tunnel - a short file with no error anywhere. end() flushes
+            // what is queued, then closes. Until the local endpoint hangs up
+            // too, the socket lingers: unregistered, but not forgotten.
+            this.forget(role, data.socketId, socket)
+            this.lingering.set(socket, role)
+            // Whatever it still has to say goes nowhere, but it must be read for
+            // the socket to notice the local endpoint hanging up.
+            this.throttled.delete(socket)
+            socket.resume()
+            socket.end()
+            return
+        }
+        if (data.buffer?.length) {
+            socket.write(data.buffer)
+            if (socket.writableLength > MAX_LOCAL_WRITE_BACKLOG) {
+                // We cannot push back on the peer: one multiplexed stream carries
+                // every tunnel and the terminal, so pausing it would stall all of
+                // them. An authenticated-but-hostile server could otherwise grow
+                // the renderer's heap without bound through a declared tunnel
+                // whose local endpoint accepts but never reads.
+                this.emitServiceMessage(
+                    'Closed a forwarded connection: the local endpoint is not reading fast enough',
+                )
+                this.closeForwardedSocket(role, data.socketId, socket)
+            }
+        }
+    }
+
+    dispose (): void {
+        this.disposed = true
+        for (const l of this.listeners) {
+            l.server.close()
+        }
+        this.listeners = []
+        // Closing the tab detaches from the remote session; it does not end
+        // it, and the server goes on holding the far end of every tunnel it
+        // was not told is over.
+        for (const role of ['source', 'destination'] as const) {
+            for (const [socketId, socket] of [...this.socketsFor(role)]) {
+                try {
+                    this.closeForwardedSocket(role, socketId, socket)
+                } catch (err) {
+                    // Telling the peer is a courtesy. Closing what is ours is not.
+                    this.logger.warn(`Could not report forwarded socket ${socketId} as closed: ${err}`)
+                }
+            }
+        }
+        for (const e of [...this.unassigned.values()]) {
+            clearTimeout(e.timer)
+            e.socket.destroy()
+        }
+        for (const s of this.pendingDestinationSockets) {
+            s.destroy()
+        }
+        this.pendingDestinationSockets.clear()
+        for (const s of [...this.sourceSockets.values(), ...this.destinationSockets.values(), ...this.lingering.keys()]) {
+            s.destroy()
+        }
+        this.lingering.clear()
+        this.throttled.clear()
+        this.unassigned.clear()
+        this.sourceSockets.clear()
+        this.sourceSocketConfigs.clear()
+        this.destinationSockets.clear()
+        this.declaredReverseDestinations = []
+        this.activeForwards.length = 0
+        this.pendingDestinations = 0
+    }
+}
