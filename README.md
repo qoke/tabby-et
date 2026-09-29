@@ -40,7 +40,11 @@ The ET server host must have `etserver` and `etterminal` installed. The plugin u
 
 ## Install
 
-tabby-et is on npm as [`tabby-et`](https://www.npmjs.com/package/tabby-et).
+tabby-et is on npm as
+[`tabby-eternal-terminal`](https://www.npmjs.com/package/tabby-eternal-terminal).
+The earlier `tabby-et` package is deprecated in its favour. Uninstall
+`tabby-et` before installing this one, because both provide the same
+connection type.
 
 You need a Tabby build with the SSH API changes described under
 [Compatibility](#compatibility), for example one built from the
@@ -52,7 +56,8 @@ changes are released in mainstream Tabby.
 ### From inside Tabby
 
 1. Open **Settings → Plugins → Available**.
-2. Search for `et` or `eternal` and find **et**.
+2. Find **eternal-terminal**. npm ranks new plugins low, so it may be
+   near the end of the list.
 3. Click **Get**.
 4. Restart Tabby.
 
@@ -64,7 +69,7 @@ Eternal Terminal is then offered as a connection type under
 Install the package into Tabby's plugin directory, then restart Tabby:
 
 ```sh
-npm install --prefix ~/.config/tabby/plugins tabby-et
+npm install --prefix ~/.config/tabby/plugins tabby-eternal-terminal
 ```
 
 The plugin directory is `~/.config/tabby/plugins` on Linux,

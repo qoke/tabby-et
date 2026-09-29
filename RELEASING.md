@@ -1,6 +1,7 @@
 # Releasing tabby-et
 
-tabby-et is published on npm as `tabby-et`, from this repository.
+tabby-et is published on npm as `tabby-eternal-terminal`, from this repository.
+Its first version went out as `tabby-et`, which is deprecated.
 
 Tabby finds plugins by searching npm for the keyword `tabby-plugin`, keeps
 the packages whose name starts with `tabby-`, and installs the version that
@@ -28,7 +29,7 @@ there: a Tabby that cannot load a plugin starts without it.
 
 ```sh
 TABBY_DIR=/path/to/tabby npm run typecheck
-xvfb-run -a node scripts/smoke-tabby.mjs --tabby /path/to/tabby --plugin /path/to/unpacked/tabby-et
+xvfb-run -a node scripts/smoke-tabby.mjs --tabby /path/to/tabby --plugin /path/to/unpacked/tabby-eternal-terminal
 ```
 
 `npm pack` and `npm publish` build the bundle themselves, through `prepack`.
@@ -54,7 +55,7 @@ into an empty directory:
 
 ```sh
 npm pack
-npm install --prefix "$(mktemp -d)" ./tabby-et-<version>.tgz
+npm install --prefix "$(mktemp -d)" ./tabby-eternal-terminal-<version>.tgz
 ```
 
 ## The first release
@@ -73,7 +74,7 @@ npm publish --access public
 Then tag the commit that was published, and push:
 
 ```sh
-git tag -a v1.0.0 -m "tabby-et 1.0.0"
+git tag -a v1.0.0 -m "tabby-eternal-terminal 1.0.0"
 git push origin main
 git push origin v1.0.0
 ```
@@ -87,11 +88,11 @@ Once the package exists, npm can be told to trust the workflow. From the
 command line, with npm 11.15 or later, logged in as an owner of the package:
 
 ```sh
-npm trust github tabby-et --file publish.yml --repository qoke/tabby-et --allow-publish
-npm trust list tabby-et
+npm trust github tabby-eternal-terminal --file publish.yml --repository qoke/tabby-et --allow-publish
+npm trust list tabby-eternal-terminal
 ```
 
-Or on npmjs.com: open the package `tabby-et`, then Settings, then Trusted
+Or on npmjs.com: open the package `tabby-eternal-terminal`, then Settings, then Trusted
 Publisher, and choose GitHub Actions:
 
 | Field | Value |
@@ -104,7 +105,7 @@ Publisher, and choose GitHub Actions:
 The filename is that of `.github/workflows/publish.yml`, without its
 directory. If the file is renamed, npm has to be told the new name. A package
 has one trusted publisher at a time: to change it, revoke the one it has with
-`npm trust revoke tabby-et --id <id>`, and create another.
+`npm trust revoke tabby-eternal-terminal --id <id>`, and create another.
 
 After the first release through the workflow has worked, publishing access of
 the package can be set to require two-factor authentication and disallow
@@ -116,7 +117,7 @@ tokens. The workflow needs no token.
 npm version patch --no-git-tag-version   # or minor, or major
 git commit -am "Release $(node -p "require('./package.json').version")"
 git push origin main
-git tag -a "v$(node -p "require('./package.json').version")" -m "tabby-et $(node -p "require('./package.json').version")"
+git tag -a "v$(node -p "require('./package.json').version")" -m "tabby-eternal-terminal $(node -p "require('./package.json').version")"
 git push origin --tags
 ```
 
@@ -134,8 +135,8 @@ npm publish --access public --tag next
 ## Checks after a release
 
 ```sh
-npm view tabby-et version keywords dist-tags
-npm install --prefix "$(mktemp -d)" tabby-et
+npm view tabby-eternal-terminal version keywords dist-tags
+npm install --prefix "$(mktemp -d)" tabby-eternal-terminal
 ```
 
 Tabby's search has to return the package. This is the request Tabby makes
@@ -154,6 +155,6 @@ Eternal Terminal profile.
 ## If a release is bad
 
 A version cannot be published twice. Publish a fixed version with a higher
-number. `npm deprecate tabby-et@<version> "<reason>"` warns whoever installs
+number. `npm deprecate tabby-eternal-terminal@<version> "<reason>"` warns whoever installs
 the bad one. `npm unpublish` is only possible for a short time after
 publishing, and the version number stays used.

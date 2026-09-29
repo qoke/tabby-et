@@ -132,8 +132,9 @@ try {
             if (!plugins.includes(`${name}@${packed.version}`)) {
                 problems.push(`${name}@${packed.version} is not among the plugins of Tabby`)
             }
-            if (!providers.includes(name)) {
-                problems.push(`Tabby has no profiles of the kind "${name}"`)
+            // The kind of profile is "et" whatever the package is called.
+            if (!providers.includes('et')) {
+                problems.push('Tabby has no profiles of the kind "et"')
             }
         }
     }

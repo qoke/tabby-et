@@ -46,13 +46,13 @@ test('Tabby is started with the plugin, and asked whether the plugin is there', 
     assert.match(smoke, /git fetch --force --tags/)
     assert.match(smoke, /name: tabby-et-plugin/)
     assert.match(smoke, /yarn run build/)
-    assert.match(smoke, /scripts\/smoke-tabby\.mjs --tabby tabby --plugin plugins\/tabby-et/)
+    assert.match(smoke, /scripts\/smoke-tabby\.mjs --tabby tabby --plugin plugins\/tabby-eternal-terminal/)
 
     // And where it is only launched, it is launched with the plugin.
     const launched = job('tabby-preview.yml', 'macos-smoke')
     assert.match(launched, /name: tabby-et-plugin/)
     assert.match(launched, /TABBY_PLUGINS=/)
-    assert.match(launched, /Could not load et/)
+    assert.match(launched, /Could not load eternal-terminal: /)
 })
 
 test('the plugin is compiled for what zone.js can follow, and the package is checked for it', () => {

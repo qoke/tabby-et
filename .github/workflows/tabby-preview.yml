@@ -40,7 +40,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: tabby-et-plugin
-          path: tabby-et-*.tgz
+          path: tabby-eternal-terminal-*.tgz
           if-no-files-found: error
           retention-days: 30
 
@@ -115,10 +115,10 @@ jobs:
           path: packed
       - name: Unpack the plugin where Tabby is to find it
         run: |
-          mkdir -p plugins/tabby-et
-          tar -xzf packed/tabby-et-*.tgz -C plugins/tabby-et --strip-components=1
+          mkdir -p plugins/tabby-eternal-terminal
+          tar -xzf packed/tabby-eternal-terminal-*.tgz -C plugins/tabby-eternal-terminal --strip-components=1
       - name: Start Tabby with the plugin, and ask it whether the plugin is there
-        run: xvfb-run -a node tabby-et/scripts/smoke-tabby.mjs --tabby tabby --plugin plugins/tabby-et
+        run: xvfb-run -a node tabby-et/scripts/smoke-tabby.mjs --tabby tabby --plugin plugins/tabby-eternal-terminal
 
   macos:
     needs: [plugin, tabby-lint]
@@ -236,18 +236,18 @@ jobs:
           xattr -dr com.apple.quarantine "$copy_dir/Tabby.app"
           codesign --verify --deep --strict --verbose=2 "$copy_dir/Tabby.app"
           # With the plugin, so that what is launched is what will be used.
-          plugin_dir="$copy_dir/plugins/tabby-et"
+          plugin_dir="$copy_dir/plugins/tabby-eternal-terminal"
           mkdir -p "$plugin_dir"
-          tar -xzf packed/tabby-et-*.tgz -C "$plugin_dir" --strip-components=1
+          tar -xzf packed/tabby-eternal-terminal-*.tgz -C "$plugin_dir" --strip-components=1
           log="$copy_dir/tabby.log"
           open -n --env TABBY_PLUGINS="$plugin_dir" --env ELECTRON_ENABLE_LOGGING=1 \
             --stdout "$log" --stderr "$log" "$copy_dir/Tabby.app"
           sleep 20
           ps -axo pid,command | grep '[T]abby.app/Contents/MacOS/Tabby'
-          if grep -q '"Could not load et' "$log"; then
-            grep '"Could not load et' "$log"
+          if grep -q '"Could not load eternal-terminal: ' "$log"; then
+            grep '"Could not load eternal-terminal: ' "$log"
             exit 1
           fi
           # The Linux job asks Tabby itself. This one goes by what Tabby says,
           # if it can be heard at all from an application that was opened.
-          grep -q '"Loading et: ' "$log" || echo "::warning::Tabby was not heard to load the plugin"
+          grep -q '"Loading eternal-terminal: ' "$log" || echo "::warning::Tabby was not heard to load the plugin"
