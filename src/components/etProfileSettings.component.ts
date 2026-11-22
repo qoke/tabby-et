@@ -16,9 +16,9 @@ import { resolveForwards } from '../session/options'
 })
 export class ETProfileSettingsComponent implements ProfileSettingsComponent<ETProfile, ETProfilesService> {
     Platform = Platform
-    profile: ProxifiedConfig<FullyDefined<ETProfile>>
+    profile!: ProxifiedConfig<FullyDefined<ETProfile>>
     sshProfiles: PartialProfile<SSHProfile>[] = []
-    @ViewChild('loginScriptsSettings') loginScriptsSettings: LoginScriptsSettingsComponent|null
+    @ViewChild('loginScriptsSettings') loginScriptsSettings: LoginScriptsSettingsComponent|null = null
 
     constructor (
         public hostApp: HostAppService,

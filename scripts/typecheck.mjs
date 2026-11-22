@@ -48,7 +48,6 @@ try {
             skipLibCheck: true,
             types: ['node'],
             typeRoots: [path.join(root, 'node_modules/@types')],
-            baseUrl: path.join(root, 'src'),
             paths: {
                 'tabby-*': [path.join(tabby, 'tabby-*')],
                 '*': [

@@ -31,7 +31,10 @@ export default {
                 options: { configFile: path.join(root, 'tsconfig.json'), transpileOnly: true },
             },
             { test: /\.js$/, include: /node_modules/, loader: path.join(root, 'scripts/strip-source-map-urls.cjs') },
-            { test: /\.pug$/, use: ['apply-loader', 'pug-loader'] },
+            {
+                test: /\.pug$/,
+                use: ['apply-loader', { loader: '@webdiscus/pug-loader', options: { mode: 'compile' } }],
+            },
             { test: /\.scss$/, use: ['@tabby-gang/to-string-loader', 'css-loader', 'sass-loader'] },
         ],
     },

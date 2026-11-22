@@ -72,7 +72,7 @@ export class ETBootstrap {
     private profiles: ProfilesService
     private config: ConfigService
     private cancelled = false
-    private rejectOnCancel: (err: Error) => void
+    private rejectOnCancel!: (err: Error) => void
     /** Ends the capture that is in flight, if there is one, and its timeout with it. */
     private abortCapture: ((err: Error) => void)|null = null
     /** Rejects when cancel() is called; every wait in run() races against it. */

@@ -32,10 +32,10 @@ function specFor (fw: ForwardedPortConfig): string {
     template: require('./etPortForwardingConfig.component.pug'),
 })
 export class ETPortForwardingConfigComponent implements DoCheck {
-    @Input() model: ForwardedPortConfig[]
+    @Input() model!: ForwardedPortConfig[]
     @Output() forwardAdded = new EventEmitter<ForwardedPortConfig>()
     @Output() forwardRemoved = new EventEmitter<ForwardedPortConfig>()
-    newForward: ForwardedPortConfig
+    newForward!: ForwardedPortConfig
     spec = ''
     specError: string|null = null
     /** ET has no Dynamic forwarding. */
@@ -113,7 +113,7 @@ export class ETPortForwardingConfigComponent implements DoCheck {
         try {
             forwards = parseTunnelSpec(this.spec, this.newForward.type)
         } catch (e) {
-            this.specError = e.message
+            this.specError = e instanceof Error ? e.message : String(e)
             return
         }
         this.pending = { forwards, spec: this.spec }

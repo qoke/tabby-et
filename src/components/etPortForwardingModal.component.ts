@@ -8,7 +8,7 @@ import { ETSession } from '../session/etSession'
     template: require('./etPortForwardingModal.component.pug'),
 })
 export class ETPortForwardingModalComponent {
-    @Input() session: ETSession
+    @Input() session!: ETSession
 
     /**
      * The forwards this SESSION has right now - NOT the profile's saved list.
@@ -38,7 +38,8 @@ export class ETPortForwardingModalComponent {
             // forward that fails to bind never appears in the list.
             await this.session.forwards.addLocalForward(fw)
         } catch (e) {
-            this.session.emitServiceMessage(`Could not forward port: ${e.message}`)
+            const message = e instanceof Error ? e.message : String(e)
+            this.session.emitServiceMessage(`Could not forward port: ${message}`)
         }
     }
 

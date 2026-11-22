@@ -45,7 +45,7 @@ export class ByteReader {
     private disposed = false
 
     constructor (private socket: Socket) {
-        socket.on('data', data => this.onData(data))
+        socket.on('data', (data: Buffer) => this.onData(data))
         socket.on('error', err => this.fail(err))
         socket.on('close', () => this.fail(new Error('Connection closed')))
         socket.on('end', () => this.fail(new Error('Connection ended by remote')))

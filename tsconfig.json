@@ -2,7 +2,7 @@
   "compilerOptions": {
     "target": "ES2016",
     "module": "ES2015",
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "esModuleInterop": true,

@@ -158,7 +158,7 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
             // Nothing that a profile may hold should get here. But what does
             // leaves a tab with no session, which shows nothing and says
             // nothing, unless it is said here.
-            this.notifications.error(e.message, this.etNotificationTitle)
+            this.notifications.error(e instanceof Error ? e.message : String(e), this.etNotificationTitle)
             void replaced?.destroy()
             return
         }
@@ -208,7 +208,7 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
             // was closed, a new session was asked for, or the connection ended
             // and has already said why.
             if (!(e instanceof ETSessionDestroyedError)) {
-                this.shown(() => this.notifications.error(e.message, this.etNotificationTitle))
+                this.shown(() => this.notifications.error(e instanceof Error ? e.message : String(e), this.etNotificationTitle))
             }
             // A session that failed mid-start() never set open=true, so the tab's
             // close path would skip BaseSession.destroy() and leak its timers and
