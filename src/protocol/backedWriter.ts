@@ -5,33 +5,24 @@ import {
     PACKET_HEADER_SIZE,
 } from './constants'
 import { UnrecoverableSessionError } from './errors'
+import { FRAME_PREFIX_SIZE, FrameLog } from './frameLog'
 import { catchupEntrySize } from './messages'
-import { PacketQueue } from './packetQueue'
 
 // Re-exported for the existing importers: the type now lives in ./errors so that
 // crypto.ts can raise it too without a cycle (backedWriter already imports crypto).
 export { UnrecoverableSessionError } from './errors'
 
-/** Framing B puts a 4-byte big-endian length in front of every serialized Packet. */
-const FRAME_PREFIX_SIZE = 4
-
 /**
  * A packet as it goes on the wire: [length][encrypted=1][header][ciphertext].
- * The length counts what follows it, not itself.
+ * The length counts what follows it, not itself. It is made where it is kept,
+ * in `log`.
  */
-function framePacket (header: number, encryptedPayload: Buffer): Buffer {
-    const length = PACKET_HEADER_SIZE + encryptedPayload.length
-    const frame = Buffer.allocUnsafe(FRAME_PREFIX_SIZE + length)
-    frame.writeInt32BE(length, 0)
+function framePacket (log: FrameLog, header: number, encryptedPayload: Buffer): Buffer {
+    const frame = log.add(PACKET_HEADER_SIZE + encryptedPayload.length)
     frame[FRAME_PREFIX_SIZE] = 1
     frame[FRAME_PREFIX_SIZE + 1] = header
     encryptedPayload.copy(frame, FRAME_PREFIX_SIZE + PACKET_HEADER_SIZE)
     return frame
-}
-
-/** The serialized Packet inside a frame, which is the form a catch-up carries. */
-function serializedPacket (frame: Buffer): Buffer {
-    return frame.subarray(FRAME_PREFIX_SIZE)
 }
 
 export class BackedWriter {
@@ -40,12 +31,15 @@ export class BackedWriter {
 
     /**
      * Everything we may still have to replay, oldest first, as wire frames. A
-     * frame that is waiting on the socket is the very buffer that is kept here,
+     * frame that is waiting on the socket is the very memory that is kept here,
      * so a backlog is held in memory once and not twice.
+     *
+     * Its size is what it holds in memory, and that is what MAX_BACKUP_BYTES
+     * limits. The server acknowledges nothing, so an idle session keeps every
+     * keepalive it has sent until the limit is reached: it has to be a limit
+     * on what they cost, and not on the 18 bytes that each of them says.
      */
-    private backupBuffer = new PacketQueue()
-    /** Serialized bytes in backupBuffer, which is how ET counts them. */
-    private backupSize = 0
+    private backupBuffer = new FrameLog()
     /**
      * While there is no socket: the bytes the server cannot have. That is what
      * was written since the last socket was lost, and what that socket was
@@ -183,10 +177,9 @@ export class BackedWriter {
             return false
         }
 
-        const frame = framePacket(header, this.crypto.encrypt(payload))
-
-        this.backupBuffer.push(frame)
-        this.backupSize += serializedLength
+        // Encrypted before there is a frame for it: if that fails, nothing is
+        // kept of a packet that was never made.
+        const frame = framePacket(this.backupBuffer, header, this.crypto.encrypt(payload))
         this.sequenceNumber++
         if (this.unconfirmed) {
             this.unconfirmed.bytes += entry
@@ -221,11 +214,11 @@ export class BackedWriter {
      * server has it.
      */
     private trim (socket: Socket): void {
-        // Counts the frame prefixes too, which errs on the side of keeping.
+        // Frames with their prefixes, which is what the buffer counts as well.
         const unsent = socket.writableLength || 0
         const keep = this.unconfirmed ? this.sequenceNumber - this.unconfirmed.from : 0
-        while (this.backupSize - unsent > MAX_BACKUP_BYTES && this.backupBuffer.length > keep) {
-            this.backupSize -= serializedPacket(this.backupBuffer.shift()!).length
+        while (this.backupBuffer.size - unsent > MAX_BACKUP_BYTES && this.backupBuffer.length > keep) {
+            this.backupBuffer.shift()
         }
     }
 
@@ -245,7 +238,8 @@ export class BackedWriter {
         // The catch-up carries everything written so far. Whatever is written
         // from here on is attach()'s to send.
         this.handedOff = this.sequenceNumber
-        const catchup = this.backupBuffer.newest(toRecover).map(serializedPacket)
+        // A catch-up carries serialized packets, which is a frame less its prefix.
+        const catchup = this.backupBuffer.newest(toRecover, FRAME_PREFIX_SIZE)
         let bytes = 0
         for (const packet of catchup) {
             bytes += catchupEntrySize(packet.length)

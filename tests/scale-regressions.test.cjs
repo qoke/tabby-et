@@ -57,43 +57,71 @@ test('a replay of more packets than a call can take arguments is still revived',
     }
 })
 
-test('a packet queue stays cheap at any length', () => {
-    const { PacketQueue } = load('src/protocol/packetQueue.ts')
-    const queue = new PacketQueue()
+test('a frame log stays cheap at any length, and gives back what was put in', () => {
+    const { FrameLog } = load('src/protocol/frameLog.ts')
+    const log = new FrameLog()
+    /** A frame as it should read: its length, then `length` bytes that say which frame it is. */
+    const expected = (index, length) => {
+        const frame = Buffer.alloc(4 + length, index % 251)
+        frame.writeInt32BE(length, 0)
+        return frame
+    }
+    const add = (index, length) => log.add(length).fill(index % 251, 4)
+
     const count = 1000000
-    const packets = Array.from({ length: 256 }, (_, i) => Buffer.from([i]))
     const started = process.hrtime.bigint()
     for (let i = 0; i < count; i++) {
-        queue.push(packets[i % 256])
+        add(i, i % 40)
     }
-    assert.equal(queue.length, count)
-    assert.deepEqual(queue.newest(2), [packets[(count - 2) % 256], packets[(count - 1) % 256]])
+    assert.equal(log.length, count)
+    assert.deepEqual(log.newest(2), [expected(count - 2, (count - 2) % 40), expected(count - 1, (count - 1) % 40)])
+    let size = log.size
     for (let i = 0; i < count; i++) {
-        if (queue.shift() !== packets[i % 256]) {
-            assert.fail(`packet ${i} came out of order`)
-        }
-        if (queue.length !== count - i - 1) {
-            assert.fail(`the queue miscounted after ${i + 1} removals`)
+        log.shift()
+        size -= 4 + i % 40
+        if (log.length !== count - i - 1 || log.size !== size) {
+            assert.fail(`the log miscounted after ${i + 1} removals`)
         }
     }
     // Array.shift() alone takes about a minute for this many.
-    assert.ok(elapsed(started) < 10000, `${count} packets took ${elapsed(started).toFixed(0)} ms`)
-    assert.equal(queue.shift(), undefined)
-    assert.deepEqual(queue.newest(1), [])
+    assert.ok(elapsed(started) < 10000, `${count} frames took ${elapsed(started).toFixed(0)} ms`)
+    assert.equal(log.size, 0)
+    log.shift()
+    assert.equal(log.length, 0)
+    assert.deepEqual(log.newest(1), [])
 
-    // Interleaved, as the replay buffer is used while connected: checked
-    // against a plain array, which is slow but obviously right.
+    // Interleaved, as the replay buffer is used while connected, and with
+    // frames of every size up to more than a chunk holds: checked against a
+    // plain array, which is slow but obviously right.
     const model = []
-    for (let i = 0; i < 10000; i += 2) {
-        for (const packet of [packets[i % 256], packets[(i + 1) % 256]]) {
-            queue.push(packet)
-            model.push(packet)
+    const handedOut = []
+    for (let i = 0; i < 6000; i++) {
+        const length = i % 500 === 499 ? 300 * 1024 + i : i * 7919 % 3000
+        const frame = add(i, length)
+        model.push(expected(i, length))
+        handedOut.push({ frame, index: i, length })
+        if (i % 3 === 2) {
+            log.shift()
+            model.shift()
         }
-        assert.equal(queue.shift(), model.shift())
-        assert.equal(queue.length, model.length)
+        if (i % 97 === 0) {
+            const some = 1 + i % 400
+            assert.deepEqual(log.newest(some), model.slice(-some))
+        }
+        assert.equal(log.length, model.length)
     }
-    assert.deepEqual(queue.newest(3), model.slice(-3))
-    assert.deepEqual(queue.newest(model.length + 10), model)
+    assert.deepEqual(log.newest(model.length + 10), model)
+    // Without the prefix, which is how a catch-up carries them.
+    assert.deepEqual(log.newest(3, 4), model.slice(-3).map(frame => frame.subarray(4)))
+    assert.equal(log.size, model.reduce((sum, frame) => sum + frame.length, 0))
+
+    // A frame that was handed out may be waiting on a socket long after it
+    // was forgotten here, and nothing that came after it was written over it.
+    for (const { frame, index, length } of handedOut) {
+        if (!frame.equals(expected(index, length))) {
+            assert.fail(`frame ${index} was written over`)
+        }
+    }
 })
 
 test('packets revived in two recoveries come out in order', async () => {
@@ -220,6 +248,79 @@ test('the replay buffer is trimmed from its oldest end, and only while connected
     }
     // Nothing was trimmed to make room for what was written while disconnected.
     assert.equal(writer.recover(70 - 63).length, 68)
+})
+
+/**
+ * What a writer holds once `frames` keepalives have gone through it, in bytes
+ * of heap and of buffers, with `between` buffers of the kind that everything
+ * else in the process makes and drops made after each of them.
+ *
+ * In a process of its own, which is the only place where what one object
+ * keeps alive can be told from what the tests around it do.
+ */
+function replayFootprint ({ frames, between = 0, encrypting = true }) {
+    const script = `
+        const { createLoader } = require(${JSON.stringify(path.join(__dirname, 'support/load.cjs'))})
+        const load = createLoader()
+        const { BackedWriter } = load('src/protocol/backedWriter.ts')
+        const { ETCrypto } = load('src/protocol/crypto.ts')
+        const settled = () => {
+            gc()
+            gc()
+            const { heapUsed, arrayBuffers } = process.memoryUsage()
+            return heapUsed + arrayBuffers
+        }
+        // Without the cipher, where it is only the number of frames that matters:
+        // an empty packet is its tag and nothing else.
+        const tag = Buffer.alloc(16)
+        const crypto = ${encrypting} ? new ETCrypto(${JSON.stringify(passkey)}, 0) : { encrypt: () => tag }
+        const writer = new BackedWriter(crypto)
+        writer.attach({ write () {} })
+        const nothing = Buffer.alloc(0)
+        const input = new Uint8Array(200)
+        const before = settled()
+        for (let i = 0; i < ${frames}; i++) {
+            writer.write(0, nothing, true)
+            for (let j = 0; j < ${between}; j++) {
+                Buffer.from(input)
+            }
+        }
+        const held = settled() - before
+        writer.detach()
+        process.stdout.write(JSON.stringify({ held, written: writer.sequenceNumber, newest: writer.recover(${frames} - 1).length }))
+    `
+    const child = spawnSync(process.execPath, ['--expose-gc', '-e', script], { timeout: 120000, maxBuffer: 1 << 20 })
+    assert.equal(child.status, 0, `the writer did not get through ${frames} keepalives: ${child.stderr}`)
+    const outcome = JSON.parse(child.stdout.toString())
+    assert.equal(outcome.written, frames)
+    assert.equal(outcome.newest, 1)
+    return outcome.held
+}
+
+const MiB = 1024 * 1024
+const inMiB = bytes => `${(bytes / MiB).toFixed(1)} MiB`
+
+test('a packet kept for replay keeps no memory alive but its own', () => {
+    // A small buffer is cut from a slab that Node shares out to everyone who
+    // asks for one, and the slab lives for as long as any piece of it does.
+    // Keystrokes, terminal output and the cipher all take pieces between two
+    // keepalives, so a keepalive of 22 bytes that was such a piece had a slab
+    // of its own to keep alive: some 4 KiB for each of them here.
+    const frames = 100000
+    const kept = frames * 22
+    const held = replayFootprint({ frames, between: 20 })
+    assert.ok(held <= 2 * kept, `${inMiB(kept)} of packets held ${inMiB(held)}`)
+})
+
+test('keepalives are held to the replay budget by what they take, not by what they say', () => {
+    const { MAX_BACKUP_BYTES } = load('src/protocol/constants.ts')
+    // The server acknowledges nothing, so every keepalive is kept until the
+    // budget is spent - and a keepalive is 18 bytes of packet. Counted as
+    // that, with a buffer object and a place in a queue each, the 64 MiB
+    // that an idle session was allowed came to several times as much.
+    const frames = Math.ceil(MAX_BACKUP_BYTES / 18) + 100000
+    const held = replayFootprint({ frames, encrypting: false })
+    assert.ok(held <= MAX_BACKUP_BYTES * 1.05, `a budget of ${inMiB(MAX_BACKUP_BYTES)} held ${inMiB(held)}`)
 })
 
 test('a truncated fixed32 field is rejected like every other truncated field', () => {
