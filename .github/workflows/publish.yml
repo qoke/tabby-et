@@ -38,7 +38,9 @@ jobs:
       - run: npm run build
       - run: npm run check:bundle
       - name: Package without running lifecycle scripts
-        run: npm pack --ignore-scripts --pack-destination packed
+        run: |
+          mkdir -p packed
+          npm pack --ignore-scripts --pack-destination packed
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: tabby-eternal-terminal-package
