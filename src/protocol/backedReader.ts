@@ -1,6 +1,6 @@
 import { ByteReader } from './byteReader'
 import { ETCrypto } from './crypto'
-import { MAX_PROTO_LENGTH, PACKET_HEADER_SIZE } from './constants'
+import { MAX_ENCRYPTED_PACKET_LENGTH, PACKET_HEADER_SIZE } from './constants'
 import { RecoveredPackets } from './messages'
 
 export interface ETPacket {
@@ -75,7 +75,7 @@ export class BackedReader {
             return null
         }
         const length = prefix.readInt32BE(0)
-        if (length < PACKET_HEADER_SIZE || length > MAX_PROTO_LENGTH) {
+        if (length < PACKET_HEADER_SIZE || length > MAX_ENCRYPTED_PACKET_LENGTH) {
             return null
         }
         const frame = this.reader!.takeNow(4 + length)
@@ -96,7 +96,7 @@ export class BackedReader {
         }
         const lengthBytes = await this.reader.read(4)
         const length = lengthBytes.readInt32BE(0)
-        if (length < PACKET_HEADER_SIZE || length > MAX_PROTO_LENGTH) {
+        if (length < PACKET_HEADER_SIZE || length > MAX_ENCRYPTED_PACKET_LENGTH) {
             throw new Error(`Invalid ET packet length ${length}`)
         }
         const serialized = await this.reader.read(length)

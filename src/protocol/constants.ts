@@ -32,6 +32,22 @@ export const PACKET_HEADER_SIZE = 2
 /** Length caps enforced by etserver; we enforce them too, defensively. */
 export const MAX_PROTO_LENGTH = 128 * 1024 * 1024
 export const MAX_HANDSHAKE_PROTO_LENGTH = 4 * 1024
+/**
+ * Largest unauthenticated catch-up we accept. The recovery handshake is in the
+ * clear, so a peer can announce a catch-up before proving it knows the session
+ * key. Keeping this below the server's general protobuf limit bounds memory
+ * spent on that unauthenticated message.
+ *
+ * This means a session whose remote catch-up exceeds 40 MiB cannot be resumed.
+ */
+export const MAX_CATCHUP_PROTO_LENGTH = 40 * 1024 * 1024
+
+/**
+ * Largest encrypted packet accepted from the server. ET sends terminal and
+ * forwarded data in 16 KiB chunks; this leaves ample room for control messages
+ * while preventing an unauthenticated frame prefix from making us buffer 128 MiB.
+ */
+export const MAX_ENCRYPTED_PACKET_LENGTH = 1024 * 1024
 
 /**
  * BackedWriter buffer limits, matching ET.

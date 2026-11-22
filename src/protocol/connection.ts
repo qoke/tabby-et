@@ -10,7 +10,7 @@ import { ETCrypto } from './crypto'
 import { UnrecoverableSessionError } from './errors'
 import {
     CLIENT_SERVER_NONCE_MSB, CONNECT_TIMEOUT, ETConnectStatus, HANDSHAKE_TIMEOUT, JUMP_REGISTRATION_RETRY,
-    MAX_HANDSHAKE_PROTO_LENGTH, MAX_PROTO_LENGTH, PROTOCOL_VERSION, READ_SLICE_MS,
+    MAX_CATCHUP_PROTO_LENGTH, MAX_HANDSHAKE_PROTO_LENGTH, MAX_PROTO_LENGTH, PROTOCOL_VERSION, READ_SLICE_MS,
     RECONNECT_INTERVAL, SERVER_CLIENT_NONCE_MSB, WRITE_HIGH_WATER_MARK,
 } from './constants'
 import {
@@ -487,7 +487,9 @@ export class ETClientConnection {
         const header = await reader.read(8, HANDSHAKE_TIMEOUT)
         const length = Number(header.readBigInt64LE(0))
         if (length < 0 || length > maxLength) {
-            throw new Error(`Invalid ET handshake message length ${length}`)
+            throw new UnrecoverableSessionError(
+                `Invalid ET handshake message length ${length} (maximum ${maxLength})`,
+            )
         }
         // A zero-length frame is legal and means "default-constructed message".
         return length === 0 ? Buffer.alloc(0) : reader.read(length, HANDSHAKE_TIMEOUT)
@@ -708,7 +710,7 @@ export class ETClientConnection {
         await this.writeProtoToTheEnd(socket, encodeCatchupBuffer(toSend))
         this.throwIfShutDown()
 
-        const recovered = decodeCatchupPackets(await this.readProto(byteReader))
+        const recovered = decodeCatchupPackets(await this.readProto(byteReader, MAX_CATCHUP_PROTO_LENGTH))
         this.throwIfShutDown()
 
         this.reader.revive(byteReader, recovered)
