@@ -1,8 +1,11 @@
 {
   "name": "tabby-eternal-terminal",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Eternal Terminal plugin for Tabby",
-  "keywords": ["tabby-plugin", "eternal-terminal"],
+  "keywords": [
+    "tabby-plugin",
+    "eternal-terminal"
+  ],
   "main": "dist/index.js",
   "scripts": {
     "build": "webpack --config webpack.config.mjs",
@@ -13,7 +16,9 @@
     "watch": "webpack --config webpack.config.mjs --watch --devtool source-map",
     "prepack": "npm run build"
   },
-  "files": ["dist/index.js"],
+  "files": [
+    "dist/index.js"
+  ],
   "author": "Relihan Myburgh",
   "license": "MIT",
   "repository": {
@@ -56,15 +61,35 @@
     "tabby-terminal": "*"
   },
   "peerDependenciesMeta": {
-    "@angular/common": { "optional": true },
-    "@angular/core": { "optional": true },
-    "@angular/forms": { "optional": true },
-    "@ng-bootstrap/ng-bootstrap": { "optional": true },
-    "ngx-toastr": { "optional": true },
-    "rxjs": { "optional": true },
-    "tabby-core": { "optional": true },
-    "tabby-settings": { "optional": true },
-    "tabby-ssh": { "optional": true },
-    "tabby-terminal": { "optional": true }
+    "@angular/common": {
+      "optional": true
+    },
+    "@angular/core": {
+      "optional": true
+    },
+    "@angular/forms": {
+      "optional": true
+    },
+    "@ng-bootstrap/ng-bootstrap": {
+      "optional": true
+    },
+    "ngx-toastr": {
+      "optional": true
+    },
+    "rxjs": {
+      "optional": true
+    },
+    "tabby-core": {
+      "optional": true
+    },
+    "tabby-settings": {
+      "optional": true
+    },
+    "tabby-ssh": {
+      "optional": true
+    },
+    "tabby-terminal": {
+      "optional": true
+    }
   }
 }
