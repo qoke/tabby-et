@@ -7,6 +7,16 @@ export const KEY_BYTES = 32
 export const NONCE_BYTES = 24
 export const MAC_BYTES = 16
 
+/** Move a nonce on by one. It is a little-endian counter, and its last byte is not part of it. */
+function advance (nonce: Uint8Array): void {
+    for (let i = 0; i < NONCE_BYTES; i++) {
+        nonce[i] = nonce[i] + 1 & 0xff
+        if (nonce[i]) {
+            break
+        }
+    }
+}
+
 /**
  * ET's CryptoHandler: XSalsa20-Poly1305 (libsodium crypto_secretbox_easy),
  * key = the 32-character passkey used directly as raw bytes, no KDF.
@@ -19,6 +29,8 @@ export const MAC_BYTES = 16
 export class ETCrypto {
     private readonly key: Uint8Array
     private readonly nonce: Uint8Array
+    /** Where the nonce after this one is worked out, before it is known to be used. */
+    private readonly following: Uint8Array
 
     constructor (passkey: string, nonceMSB: number) {
         if (passkey.length !== KEY_BYTES) {
@@ -27,20 +39,28 @@ export class ETCrypto {
         this.key = Uint8Array.from(Buffer.from(passkey, 'ascii'))
         this.nonce = new Uint8Array(NONCE_BYTES)
         this.nonce[NONCE_BYTES - 1] = nonceMSB
+        this.following = new Uint8Array(NONCE_BYTES)
     }
 
     private increment (): void {
-        for (let i = 0; i < NONCE_BYTES; i++) {
-            this.nonce[i] = this.nonce[i] + 1 & 0xff
-            if (this.nonce[i]) {
-                break
-            }
-        }
+        advance(this.nonce)
     }
 
+    /**
+     * The nonce moves on when there is a packet under it, and not before.
+     *
+     * Making the packet takes memory, and there may be none: a renderer that
+     * has run out of it fails every allocation, this one among them. A nonce
+     * that had moved on by then would be one that no packet was sent under,
+     * and the server would be asked to take the next packet for it. It
+     * cannot, and no later packet either.
+     */
     encrypt (plaintext: Buffer): Buffer {
-        this.increment()
-        return Buffer.from(nacl.secretbox(Uint8Array.from(plaintext), this.nonce, this.key))
+        this.following.set(this.nonce)
+        advance(this.following)
+        const sealed = Buffer.from(nacl.secretbox(Uint8Array.from(plaintext), this.following, this.key))
+        this.nonce.set(this.following)
+        return sealed
     }
 
     decrypt (ciphertext: Buffer): Buffer {

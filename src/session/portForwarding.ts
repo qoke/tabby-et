@@ -10,6 +10,7 @@ import {
     decodePortForwardDestinationResponse, encodePortForwardData,
     encodePortForwardDestinationRequest, encodePortForwardDestinationResponse,
 } from '../protocol/messages'
+import { PieceGatherer } from '../protocol/pieceGatherer'
 import { resolveFlag, resolveForwards, resolvePort } from './options'
 import { isLoopbackBindAddress } from './tunnelSpec'
 
@@ -67,7 +68,44 @@ const DESTINATION_RESPONSE_TIMEOUT = 30000
  * backpressure to the peer without stalling every other tunnel and the terminal
  * as well. Bound the damage to the one socket that is not keeping up instead.
  */
-const MAX_LOCAL_WRITE_BACKLOG = 8 * 1024 * 1024
+export const MAX_LOCAL_WRITE_BACKLOG = 8 * 1024 * 1024
+/**
+ * How much may sit queued for all the local sockets of a session together.
+ *
+ * Each of them may be the one that is not keeping up, and there can be
+ * hundreds: at 8 MiB apiece that is gigabytes, with every one of them inside
+ * its limit. Past this, the one that holds the most is given up.
+ */
+export const MAX_TOTAL_LOCAL_WRITE_BACKLOG = 64 * 1024 * 1024
+/**
+ * A socket with no more than this queued cannot be why the total is too high:
+ * if every socket that may be open at once held as much, the total would only
+ * just be reached. So the total is not worked out for it.
+ */
+const UNREMARKABLE_LOCAL_WRITE_BACKLOG
+    = MAX_TOTAL_LOCAL_WRITE_BACKLOG / (MAX_CONCURRENT_SOURCE_SOCKETS + MAX_CONCURRENT_DESTINATION_SOCKETS)
+/** The room that is made at a time for what is waiting for one socket. */
+const WAITING_BLOCK_BYTES = 16 * 1024
+
+/**
+ * What the peer has sent for a local socket that the socket has not been
+ * given yet.
+ *
+ * A socket is given one thing at a time, and what arrives until the kernel
+ * has taken that waits here, put together. Given to the socket a packet at a
+ * time, it would be queued a packet at a time, and a queue entry costs some
+ * two hundred bytes whatever it holds: a peer that sent its data in small
+ * packets had ten times MAX_LOCAL_WRITE_BACKLOG held for a socket that the
+ * limit said was within it.
+ */
+interface Waiting {
+    pieces: Buffer[]
+    /** How many bytes there are in `pieces`. */
+    bytes: number
+    gatherer: PieceGatherer
+    /** The socket has been given something that the kernel has not taken all of. */
+    busy: boolean
+}
 
 /**
  * What a destination endpoint actually resolves to.
@@ -209,6 +247,8 @@ export class ETPortForwardHandler {
     private lingering = new Map<Socket, Role>()
     /** Sockets we have stopped reading from until the connection can take more. */
     private throttled = new Set<Socket>()
+    /** What is waiting for each local socket that has, or had, something waiting. */
+    private waiting = new Map<Socket, Waiting>()
     /** We are turning local connections away, and have said so. */
     private refusing = false
     private disposed = false
@@ -768,6 +808,7 @@ export class ETPortForwardHandler {
         socket.on('close', () => {
             this.lingering.delete(socket)
             this.throttled.delete(socket)
+            this.waiting.delete(socket)
             this.forget(role, socketId, socket)
         })
     }
@@ -885,12 +926,20 @@ export class ETPortForwardHandler {
             // the socket to notice the local endpoint hanging up.
             this.throttled.delete(socket)
             socket.resume()
+            // What was waiting for the socket goes first, and is the socket's
+            // to deliver from here on.
+            const waiting = this.waiting.get(socket)
+            this.waiting.delete(socket)
+            for (const piece of waiting?.pieces ?? []) {
+                socket.write(piece)
+            }
             socket.end()
             return
         }
         if (data.buffer?.length) {
-            socket.write(data.buffer)
-            if (socket.writableLength > MAX_LOCAL_WRITE_BACKLOG) {
+            this.deliver(socket, data.buffer)
+            const backlog = this.backlogOf(socket)
+            if (backlog > MAX_LOCAL_WRITE_BACKLOG) {
                 // We cannot push back on the peer: one multiplexed stream carries
                 // every tunnel and the terminal, so pausing it would stall all of
                 // them. An authenticated-but-hostile server could otherwise grow
@@ -900,7 +949,100 @@ export class ETPortForwardHandler {
                     'Closed a forwarded connection: the local endpoint is not reading fast enough',
                 )
                 this.closeForwardedSocket(role, data.socketId, socket)
+            } else if (backlog > UNREMARKABLE_LOCAL_WRITE_BACKLOG) {
+                this.boundTotalBacklog()
             }
+        }
+    }
+
+    /** Give `data` to a local socket, or keep it for when the socket can be given more. */
+    private deliver (socket: Socket, data: Buffer): void {
+        let waiting = this.waiting.get(socket)
+        if (!waiting) {
+            waiting = { pieces: [], bytes: 0, gatherer: new PieceGatherer(WAITING_BLOCK_BYTES), busy: false }
+            this.waiting.set(socket, waiting)
+        }
+        if (waiting.busy) {
+            waiting.gatherer.add(waiting.pieces, data)
+            waiting.bytes += data.length
+        } else {
+            this.handOver(socket, waiting, [data])
+        }
+    }
+
+    /** Give `pieces` to a socket, and what has gathered meanwhile once the kernel has taken them. */
+    private handOver (socket: Socket, waiting: Waiting, pieces: Buffer[]): void {
+        waiting.busy = true
+        const taken = () => {
+            waiting.busy = false
+            // Not if the tunnel is closed, or the socket: then what was
+            // waiting has been dealt with, one way or the other.
+            if (waiting.pieces.length && this.waiting.get(socket) === waiting && !socket.destroyed) {
+                const gathered = waiting.pieces
+                waiting.pieces = []
+                waiting.bytes = 0
+                this.handOver(socket, waiting, gathered)
+            }
+        }
+        if (pieces.length > 1) {
+            socket.cork()
+        }
+        for (let i = 0; i < pieces.length; i++) {
+            socket.write(pieces[i], i === pieces.length - 1 ? taken : undefined)
+        }
+        if (pieces.length > 1) {
+            socket.uncork()
+        }
+    }
+
+    /** How much is queued for a local socket: what it has been given, and what is waiting for it. */
+    private backlogOf (socket: Socket): number {
+        return (socket.writableLength || 0) + (this.waiting.get(socket)?.bytes ?? 0)
+    }
+
+    /**
+     * See that no more is queued for local sockets, all told, than a session
+     * may hold: if there is, the socket with the most queued is closed.
+     *
+     * One at a time. If that was not enough, the next packet for a socket that
+     * is not keeping up brings us back here.
+     */
+    private boundTotalBacklog (): void {
+        let total = 0
+        let most: { socket: Socket, backlog: number, tunnel: { role: Role, socketId: number }|null }|null = null
+        const count = (socket: Socket, tunnel: { role: Role, socketId: number }|null) => {
+            // A socket that has been closed has let go of what it held, and
+            // does not say so.
+            if (socket.destroyed) {
+                return
+            }
+            const backlog = this.backlogOf(socket)
+            total += backlog
+            if (!most || backlog > most.backlog) {
+                most = { socket, backlog, tunnel }
+            }
+        }
+        for (const role of ['source', 'destination'] as const) {
+            for (const [socketId, socket] of this.socketsFor(role)) {
+                count(socket, { role, socketId })
+            }
+        }
+        // Their tunnels are closed, and what they were sent before that is
+        // still theirs to deliver, for as long as there is room for it.
+        for (const socket of this.lingering.keys()) {
+            count(socket, null)
+        }
+        const worst = most as { socket: Socket, tunnel: { role: Role, socketId: number }|null }|null
+        if (total <= MAX_TOTAL_LOCAL_WRITE_BACKLOG || !worst) {
+            return
+        }
+        this.emitServiceMessage(
+            'Closed a forwarded connection: too much is waiting for local endpoints that are not reading',
+        )
+        if (worst.tunnel) {
+            this.closeForwardedSocket(worst.tunnel.role, worst.tunnel.socketId, worst.socket)
+        } else {
+            worst.socket.destroy()
         }
     }
 
@@ -936,6 +1078,7 @@ export class ETPortForwardHandler {
         }
         this.lingering.clear()
         this.throttled.clear()
+        this.waiting.clear()
         this.unassigned.clear()
         this.sourceSockets.clear()
         this.sourceSocketConfigs.clear()

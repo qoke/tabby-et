@@ -15,7 +15,7 @@ import {
 } from './constants'
 import {
     decodeCatchupPackets, decodeConnectResponse, decodeSequenceHeader,
-    encodeCatchupBuffer, encodeConnectRequest, encodeSequenceHeader,
+    encodeConnectRequest, encodeSequenceHeader,
 } from './messages'
 
 /** How long shutdown() lets what is already queued go out before it hangs up. */
@@ -228,9 +228,19 @@ export class ETClientConnection {
         if (this.shuttingDown) {
             return true
         }
-        const written = this.writer.write(header, payload, urgent)
-        if (!written) {
-            this.logger.warn('ET write buffer is full; dropping a packet')
+        let written = false
+        try {
+            written = this.writer.write(header, payload, urgent)
+            if (!written) {
+                this.logger.warn('ET write buffer is full; dropping a packet')
+            }
+        } catch (err) {
+            // There was no memory to make it of, most likely. The writer has
+            // kept nothing of it, so it is a packet that was dropped, and
+            // whoever sent it knows what to do about one of those: a tunnel
+            // is closed and not left with a hole in it. Thrown from here, it
+            // would be lost all the same, and nobody would know.
+            this.logger.warn(`Could not make an ET packet; dropping it: ${err}`)
         }
         this.options.debug?.(`-> header=${header} bytes=${payload.length} seq=${this.writer.sequenceNumber}${written ? '' : ' DROPPED'}`)
         return written
@@ -708,8 +718,8 @@ export class ETClientConnection {
             await this.readProto(byteReader, MAX_HANDSHAKE_PROTO_LENGTH),
         )
 
-        const toSend = this.writer.recover(remoteSequence)
-        await this.writeProtoToTheEnd(socket, encodeCatchupBuffer(toSend))
+        const catchup = this.writer.recover(remoteSequence)
+        await this.writeProtoToTheEnd(socket, catchup.message)
         this.throwIfShutDown()
 
         const recovered = decodeCatchupPackets(await this.readProto(byteReader, MAX_CATCHUP_PROTO_LENGTH))
@@ -718,7 +728,7 @@ export class ETClientConnection {
         this.reader.revive(byteReader, recovered)
         this.writer.attach(socket)
 
-        this.logger.info(`ET session resumed: replayed ${toSend.length} out, ${recovered.length} in`)
+        this.logger.info(`ET session resumed: replayed ${catchup.packets} out, ${recovered.length} in`)
     }
 
     private end (reason: string): void {

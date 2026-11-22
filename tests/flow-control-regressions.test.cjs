@@ -20,7 +20,7 @@ const { ETCrypto } = load('src/protocol/crypto.ts')
 const { decodeTerminalBuffer, encodeTerminalBuffer } = load('src/protocol/messages.ts')
 const { ETPortForwardHandler } = load('src/session/portForwarding.ts')
 const { ETPacketType, MAX_PROTO_LENGTH, WRITE_HIGH_WATER_MARK } = load('src/protocol/constants.ts')
-const { encodeCatchupBuffer } = load('src/protocol/messages.ts')
+const { decodeCatchupBuffer } = load('src/protocol/messages.ts')
 const {
     decodePortForwardData, decodePortForwardDestinationRequest,
     encodePortForwardDestinationResponse,
@@ -242,7 +242,7 @@ test('the replay buffer keeps whatever the socket has not taken', () => {
     // only three of the ten, so a server that is missing more could never be
     // caught up.
     writer.detach()
-    assert.equal(writer.recover(0).length, 70)
+    assert.equal(writer.recover(0).packets, 70)
 
     // Once the socket has taken it, and the server has been seen to have it,
     // the usual limit applies again.
@@ -253,7 +253,7 @@ test('the replay buffer keeps whatever the socket has not taken', () => {
     writer.write(ETPacketType.TERMINAL_BUFFER, megabyte)
     writer.detach()
     assert.throws(() => writer.recover(0), /already been trimmed/)
-    assert.equal(writer.recover(71 - 63).length, 63)
+    assert.equal(writer.recover(71 - 63).packets, 63)
 })
 
 test('input queued behind a stalled link survives a reconnect', async () => {
@@ -323,10 +323,10 @@ test('what is waiting to be sent always fits in one recovery message', () => {
     // The server has none of it. A recovery message of more than 128 MiB is
     // refused by etserver on every attempt, so the session could never resume.
     writer.detach()
-    const replay = writer.recover(0)
-    assert.equal(replay.length, accepted)
-    const message = encodeCatchupBuffer(replay)
+    const { packets, message } = writer.recover(0)
+    assert.equal(packets, accepted)
     assert.ok(message.length <= MAX_PROTO_LENGTH, `the recovery message is ${message.length} bytes`)
+    const replay = decodeCatchupBuffer(message)
 
     // What was refused took no nonce: what was accepted still decrypts in order.
     const server = new ETCrypto(passkey, 0)
@@ -351,7 +351,7 @@ test('what a lost socket had not sent counts against what may wait while disconn
     }
     // 64 MiB in all, not 64 MiB on top of the 40 that never left.
     assert.equal(accepted, 23)
-    assert.ok(encodeCatchupBuffer(writer.recover(0)).length <= MAX_PROTO_LENGTH)
+    assert.ok(writer.recover(0).message.length <= MAX_PROTO_LENGTH)
 })
 
 test('input beyond what can be replayed is refused, and the user is told', async () => {
@@ -407,7 +407,7 @@ test('there is always room for a control message', () => {
     assert.ok(accepted < 1e6, 'control messages are accepted without limit')
 
     writer.detach()
-    assert.ok(encodeCatchupBuffer(writer.recover(0)).length <= MAX_PROTO_LENGTH)
+    assert.ok(writer.recover(0).message.length <= MAX_PROTO_LENGTH)
 })
 
 test('a tunnel that closes while the link is stalled is still closed on the far side', async () => {

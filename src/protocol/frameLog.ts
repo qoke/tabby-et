@@ -80,6 +80,21 @@ export class FrameLog {
         return frame
     }
 
+    /**
+     * Take back the frame that add() gave out last, which is `frame`: it was
+     * never filled in, and nobody else has been given it.
+     */
+    retract (frame: Buffer): void {
+        const chunk = this.chunks[this.chunks.length - 1]
+        chunk.end -= frame.length
+        chunk.frames--
+        this.frames--
+        this.bytes -= frame.length
+        if (!chunk.frames) {
+            this.chunks.pop()
+        }
+    }
+
     /** Forget the oldest frame. */
     shift (): void {
         const chunk = this.chunks[0]
@@ -98,11 +113,22 @@ export class FrameLog {
         }
     }
 
-    /** The newest `count` frames, oldest first, each without its first `skip` bytes. */
-    newest (count: number, skip = 0): Buffer[] {
+    /** The newest `count` frames, oldest first. */
+    newest (count: number): Buffer[] {
+        const out: Buffer[] = []
+        this.eachNewest(count, (bytes, start, end) => out.push(bytes.subarray(start, end)))
+        return out
+    }
+
+    /**
+     * Go through the newest `count` frames, oldest first, and say where each
+     * of them is: in `bytes`, from `start` to `end`. Nothing is made for a
+     * frame, which is the point when there are millions of them.
+     */
+    eachNewest (count: number, visit: (bytes: Buffer, start: number, end: number) => void): void {
         count = Math.min(count, this.frames)
         if (count <= 0) {
-            return []
+            return
         }
         // The chunk that the oldest of them is in, and how many of its frames
         // are older still.
@@ -111,7 +137,6 @@ export class FrameLog {
         while (older < 0) {
             older += this.chunks[--index].frames
         }
-        const out: Buffer[] = []
         for (; index < this.chunks.length; index++) {
             const { bytes, start, end } = this.chunks[index]
             for (let at = start; at < end;) {
@@ -119,11 +144,10 @@ export class FrameLog {
                 if (older > 0) {
                     older--
                 } else {
-                    out.push(bytes.subarray(at + skip, next))
+                    visit(bytes, at, next)
                 }
                 at = next
             }
         }
-        return out
     }
 }

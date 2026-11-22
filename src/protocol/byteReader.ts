@@ -1,5 +1,7 @@
 import { Socket } from 'net'
 
+import { PieceGatherer } from './pieceGatherer'
+
 /**
  * Flow-control thresholds for the unread backlog. Reads are driven by a single
  * async loop, so a peer that writes faster than we parse would otherwise grow
@@ -28,8 +30,13 @@ export class ByteReader {
      * Joining them as they arrive would copy the whole backlog once per piece,
      * which for a single large frame - a catch-up buffer after an outage - adds
      * up to many seconds of copying. They are joined once, when a read needs to.
+     *
+     * Except the small ones, which are put together as they arrive: see
+     * PieceGatherer. How large the pieces are is up to whoever sends them,
+     * and a read may wait for 128 MiB of them.
      */
     private chunks: Buffer[] = []
+    private gatherer = new PieceGatherer()
     /** Total bytes in `chunks`. */
     private buffered = 0
     private waiter: Waiter|null = null
@@ -49,7 +56,7 @@ export class ByteReader {
         if (!data.length || this.disposed) {
             return
         }
-        this.chunks.push(data)
+        this.gatherer.add(this.chunks, data)
         this.buffered += data.length
         this.pump()
         this.updateFlow()

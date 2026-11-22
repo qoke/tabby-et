@@ -18,6 +18,7 @@ const { BackedReader } = load('src/protocol/backedReader.ts')
 const { BackedWriter } = load('src/protocol/backedWriter.ts')
 const { ETCrypto } = load('src/protocol/crypto.ts')
 const { decodeFields } = load('src/protocol/protobuf.ts')
+const { decodeCatchupBuffer } = load('src/protocol/messages.ts')
 
 const passkey = 'RegressionTestPasskey00000000000'
 
@@ -111,8 +112,10 @@ test('a frame log stays cheap at any length, and gives back what was put in', ()
         assert.equal(log.length, model.length)
     }
     assert.deepEqual(log.newest(model.length + 10), model)
-    // Without the prefix, which is how a catch-up carries them.
-    assert.deepEqual(log.newest(3, 4), model.slice(-3).map(frame => frame.subarray(4)))
+    // Where they are, with nothing made for any of them.
+    const found = []
+    log.eachNewest(3, (bytes, start, end) => found.push(Buffer.from(bytes.subarray(start, end))))
+    assert.deepEqual(found, model.slice(-3))
     assert.equal(log.size, model.reduce((sum, frame) => sum + frame.length, 0))
 
     // A frame that was handed out may be waiting on a socket long after it
@@ -217,13 +220,13 @@ test('writing stays cheap however much there is to replay', () => {
 
     writer.detach()
     const replay = writer.recover(count - 3)
-    assert.equal(replay.length, 3)
+    assert.equal(replay.packets, 3)
     const server = new ETCrypto(passkey, 0)
     // Oldest first, and the very packets the server is missing.
     for (let i = 0; i < count - 3; i++) {
         server.increment()
     }
-    for (const serialized of replay) {
+    for (const serialized of decodeCatchupBuffer(replay.message)) {
         assert.deepEqual(server.decrypt(serialized.subarray(2)), payload)
     }
 })
@@ -237,9 +240,9 @@ test('the replay buffer is trimmed from its oldest end, and only while connected
     }
     assert.equal(writer.sequenceNumber, 70)
     assert.throws(() => writer.recover(0), /already been trimmed/)
-    assert.equal(writer.recover(69).length, 1)
+    assert.equal(writer.recover(69).packets, 1)
     // 64 MiB of 1 MiB packets: the newest 63 fit under the cap with their framing.
-    assert.equal(writer.recover(70 - 63).length, 63)
+    assert.equal(writer.recover(70 - 63).packets, 63)
     assert.throws(() => writer.recover(70 - 64), /already been trimmed/)
 
     writer.detach()
@@ -247,33 +250,51 @@ test('the replay buffer is trimmed from its oldest end, and only while connected
         assert.equal(writer.write(1, megabyte), true)
     }
     // Nothing was trimmed to make room for what was written while disconnected.
-    assert.equal(writer.recover(70 - 63).length, 68)
+    assert.equal(writer.recover(70 - 63).packets, 68)
 })
 
 /**
- * What a writer holds once `frames` keepalives have gone through it, in bytes
- * of heap and of buffers, with `between` buffers of the kind that everything
- * else in the process makes and drops made after each of them.
+ * Run `body` in a process of its own, and return what it returns.
  *
- * In a process of its own, which is the only place where what one object
- * keeps alive can be told from what the tests around it do.
+ * That is the only place where what one object keeps alive can be told from
+ * what the tests around it do. The body is given `load`, for the sources, and
+ * `settled`, which is what the process holds at that moment in bytes of heap
+ * and of buffers, once everything that nothing refers to has been collected.
  */
-function replayFootprint ({ frames, between = 0, encrypting = true }) {
+function measured (body) {
     const script = `
         const { createLoader } = require(${JSON.stringify(path.join(__dirname, 'support/load.cjs'))})
         const load = createLoader()
-        const { BackedWriter } = load('src/protocol/backedWriter.ts')
-        const { ETCrypto } = load('src/protocol/crypto.ts')
         const settled = () => {
             gc()
             gc()
             const { heapUsed, arrayBuffers } = process.memoryUsage()
             return heapUsed + arrayBuffers
         }
+        const passkey = ${JSON.stringify(passkey)}
+        Promise.resolve((${body})()).then(outcome => {
+            process.stdout.write(JSON.stringify(outcome))
+            process.exit(0)
+        })
+    `
+    const child = spawnSync(process.execPath, ['--expose-gc', '-e', script], { timeout: 120000, maxBuffer: 1 << 20 })
+    assert.equal(child.status, 0, `the measurement did not finish: ${child.stderr}`)
+    return JSON.parse(child.stdout.toString())
+}
+
+/**
+ * What a writer holds once `frames` keepalives have gone through it, with
+ * `between` buffers of the kind that everything else in the process makes and
+ * drops made after each of them.
+ */
+function replayFootprint ({ frames, between = 0, encrypting = true }) {
+    const outcome = measured(`() => {
+        const { BackedWriter } = load('src/protocol/backedWriter.ts')
+        const { ETCrypto } = load('src/protocol/crypto.ts')
         // Without the cipher, where it is only the number of frames that matters:
         // an empty packet is its tag and nothing else.
         const tag = Buffer.alloc(16)
-        const crypto = ${encrypting} ? new ETCrypto(${JSON.stringify(passkey)}, 0) : { encrypt: () => tag }
+        const crypto = ${encrypting} ? new ETCrypto(passkey, 0) : { encrypt: () => tag }
         const writer = new BackedWriter(crypto)
         writer.attach({ write () {} })
         const nothing = Buffer.alloc(0)
@@ -287,11 +308,8 @@ function replayFootprint ({ frames, between = 0, encrypting = true }) {
         }
         const held = settled() - before
         writer.detach()
-        process.stdout.write(JSON.stringify({ held, written: writer.sequenceNumber, newest: writer.recover(${frames} - 1).length }))
-    `
-    const child = spawnSync(process.execPath, ['--expose-gc', '-e', script], { timeout: 120000, maxBuffer: 1 << 20 })
-    assert.equal(child.status, 0, `the writer did not get through ${frames} keepalives: ${child.stderr}`)
-    const outcome = JSON.parse(child.stdout.toString())
+        return { held, written: writer.sequenceNumber, newest: writer.recover(${frames} - 1).packets }
+    }`)
     assert.equal(outcome.written, frames)
     assert.equal(outcome.newest, 1)
     return outcome.held
@@ -321,6 +339,140 @@ test('keepalives are held to the replay budget by what they take, not by what th
     const frames = Math.ceil(MAX_BACKUP_BYTES / 18) + 100000
     const held = replayFootprint({ frames, encrypting: false })
     assert.ok(held <= MAX_BACKUP_BYTES * 1.05, `a budget of ${inMiB(MAX_BACKUP_BYTES)} held ${inMiB(held)}`)
+})
+
+test('what is waiting to be read holds its bytes, however small the pieces it came in', () => {
+    // A read waits for as much as it was told to expect, which a catch-up
+    // makes up to 128 MiB, and nothing has vouched for that message yet.
+    // Whoever sends it decides how it arrives. A byte at a time, each byte
+    // was a buffer of its own: two hundred times what was counted.
+    const pieces = 1000000
+    const { held, read } = measured(`async () => {
+        const { EventEmitter } = require('node:events')
+        const { ByteReader } = load('src/protocol/byteReader.ts')
+        const socket = new EventEmitter()
+        socket.pause = socket.resume = () => {}
+        const reader = new ByteReader(socket)
+        const pending = reader.read(${pieces} + 1, 30000)
+        const before = settled()
+        for (let i = 0; i < ${pieces}; i++) {
+            // As a socket delivers them: each in memory of its own.
+            socket.emit('data', Buffer.allocUnsafeSlow(1).fill(i % 251))
+        }
+        const held = settled() - before
+        socket.emit('data', Buffer.from([7]))
+        const message = await pending
+        let intact = message.length === ${pieces} + 1 && message[${pieces}] === 7
+        for (let i = 0; intact && i < ${pieces}; i++) {
+            intact = message[i] === i % 251
+        }
+        return { held, read: intact }
+    }`)
+    assert.equal(read, true, 'the bytes that were read are not the bytes that were sent')
+    assert.ok(held <= 4 * pieces, `${inMiB(pieces)} that was waiting held ${inMiB(held)}`)
+})
+
+test('what is queued for a forwarded connection holds its bytes, however small the packets it came in', () => {
+    // A local endpoint that does not read, and a peer that sends its data
+    // sixteen bytes to the packet. What is queued for the endpoint is limited
+    // by its bytes, and each packet was queued by itself: a buffer, a view of
+    // it and a place in the socket's queue, ten times and more what it held.
+    const packets = 600000
+    const { most } = measured(`async () => {
+        const net = require('node:net')
+        const { ETPortForwardHandler } = load('src/session/portForwarding.ts')
+        const { ETPacketType } = load('src/protocol/constants.ts')
+        const messages = load('src/protocol/messages.ts')
+
+        const connections = []
+        const server = net.createServer(socket => connections.push(socket.pause()))
+        await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+        const { port } = server.address()
+        const sent = []
+        const quiet = { debug () {}, info () {}, warn () {}, error () {}, log () {} }
+        const handler = new ETPortForwardHandler(quiet, (header, payload) => sent.push(payload), () => {})
+        handler.buildReverseTunnelRequests({
+            forwardedPorts: [{ type: 'Remote', host: '127.0.0.1', port: 9000, targetAddress: 'localhost', targetPort: port }],
+        })
+        handler.handlePacket(ETPacketType.PORT_FORWARD_DESTINATION_REQUEST,
+            messages.encodePortForwardDestinationRequest({ destination: { port }, fd: 1 }))
+        while (!sent.length || !connections.length) {
+            await new Promise(resolve => setTimeout(resolve, 5))
+        }
+        const { socketId } = messages.decodePortForwardDestinationResponse(sent[0])
+
+        const data = Buffer.alloc(16, 1)
+        const before = settled()
+        let most = 0
+        for (let i = 1; i <= ${packets}; i++) {
+            handler.handlePacket(ETPacketType.PORT_FORWARD_DATA,
+                messages.encodePortForwardData({ sourceToDestination: true, socketId, buffer: data }))
+            if (i % 50000 === 0) {
+                await new Promise(resolve => setImmediate(resolve))
+                most = Math.max(most, settled() - before)
+            }
+        }
+        return { most }
+    }`)
+    assert.ok(most <= 2 * packets * 16, `${inMiB(packets * 16)} that was sent held ${inMiB(most)}`)
+})
+
+test('small pieces that are put together are not written over once they have been read', async () => {
+    const socket = createSocket()
+    const reader = new ByteReader(socket)
+    const sent = Buffer.from(Array.from({ length: 300000 }, (_, i) => i * 7 % 251))
+    // In pieces of every kind: small ones that are gathered, large ones that
+    // are not, and reads that take them while more arrive behind them.
+    const taken = []
+    let offset = 0
+    let turn = 0
+    while (offset < sent.length) {
+        for (let i = 0; i < 5 && offset < sent.length; i++, turn++) {
+            const length = Math.min(turn % 11 === 10 ? 6000 : 1 + turn * 31 % 700, sent.length - offset)
+            socket.emit('data', Buffer.from(sent.subarray(offset, offset + length)))
+            offset += length
+        }
+        // Not all of it, so that there is always something to gather onto.
+        const part = await reader.read(1 + turn * 13 % 900)
+        taken.push(part)
+    }
+    const rest = sent.length - taken.reduce((sum, part) => sum + part.length, 0)
+    taken.push(await reader.read(rest))
+    // Compared at the very end: a buffer that was read early is still what
+    // it was, whatever has been gathered since.
+    assert.deepEqual(Buffer.concat(taken), sent)
+})
+
+test('a catch-up is made in one piece, with nothing made for each packet in it', () => {
+    // A catch-up is as many packets long as the outage was busy, and a
+    // packet may be a keystroke. A buffer for each tag, each length and each
+    // packet, and a view of each packet to start with, came to twenty times
+    // the message: what was alive while it was made is what counts here, so
+    // it is the most that the process ever held that is measured.
+    const packets = 1000000
+    const { message, grew, intact } = measured(`() => {
+        const { BackedWriter } = load('src/protocol/backedWriter.ts')
+        const { decodeCatchupPackets } = load('src/protocol/messages.ts')
+        const tag = Buffer.alloc(16, 7)
+        const writer = new BackedWriter({ encrypt: () => tag })
+        const nothing = Buffer.alloc(0)
+        // With no socket: the server has none of them.
+        for (let i = 0; i < ${packets}; i++) {
+            writer.write(0, nothing, true)
+        }
+        settled()
+        const before = process.resourceUsage().maxRSS
+        const catchup = writer.recover(0)
+        const grew = (process.resourceUsage().maxRSS - before) * 1024
+        const recovered = decodeCatchupPackets(catchup.message)
+        const expected = Buffer.concat([Buffer.from([1, 0]), tag])
+        const intact = catchup.packets === ${packets} && recovered.length === ${packets}
+            && recovered.at(0).equals(expected) && recovered.at(${packets} - 1).equals(expected)
+        return { message: catchup.message.length, grew, intact }
+    }`)
+    assert.equal(intact, true, 'the catch-up does not carry the packets that were written')
+    assert.equal(message, packets * 20)
+    assert.ok(grew <= 3 * message, `making a catch-up of ${inMiB(message)} took ${inMiB(grew)}`)
 })
 
 test('a truncated fixed32 field is rejected like every other truncated field', () => {

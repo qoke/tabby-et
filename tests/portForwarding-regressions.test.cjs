@@ -7,7 +7,9 @@ const net = require('node:net')
 const { createLoader, createLogger, waitFor } = require('./support/load.cjs')
 
 const load = createLoader()
-const { ETPortForwardHandler } = load('src/session/portForwarding.ts')
+const {
+    ETPortForwardHandler, MAX_LOCAL_WRITE_BACKLOG, MAX_TOTAL_LOCAL_WRITE_BACKLOG,
+} = load('src/session/portForwarding.ts')
 const { ETPacketType } = load('src/protocol/constants.ts')
 const {
     decodePortForwardData, decodePortForwardDestinationRequest, decodePortForwardDestinationResponse,
@@ -112,6 +114,136 @@ test('data queued for a tunnel is still delivered after the peer closes it', asy
 
         await waitFor(() => ended, 'the EOF to reach the local service')
         assert.equal(Buffer.concat(received).length, body.length)
+    } finally {
+        handler.dispose()
+        await service.close()
+    }
+})
+
+/** Have the peer open `count` reverse-tunnel connections to `service`; returns their socket ids, in order. */
+async function openReverseTunnels (handler, packets, service, count) {
+    handler.buildReverseTunnelRequests({
+        forwardedPorts: [{
+            type: 'Remote', host: '127.0.0.1', port: 9000, targetAddress: 'localhost', targetPort: service.port,
+        }],
+        forwardAgent: false,
+    })
+    for (let fd = 1; fd <= count; fd++) {
+        handler.handlePacket(ETPacketType.PORT_FORWARD_DESTINATION_REQUEST,
+            encodePortForwardDestinationRequest({ destination: { port: service.port }, fd }))
+    }
+    const responses = () => packets
+        .filter(x => x.header === ETPacketType.PORT_FORWARD_DESTINATION_RESPONSE)
+        .map(x => decodePortForwardDestinationResponse(x.payload))
+    await waitFor(() => responses().length === count, 'the destination responses')
+    await waitFor(() => service.connections.length === count, 'the local service to accept')
+    return responses().sort((a, b) => a.clientFd - b.clientFd).map(x => x.socketId)
+}
+
+const sendTo = (handler, socketId, buffer) => handler.handlePacket(ETPacketType.PORT_FORWARD_DATA,
+    encodePortForwardData({ sourceToDestination: true, socketId, buffer }))
+/** Let the sockets get on with what they have been given. */
+const breathe = () => new Promise(resolve => setImmediate(resolve))
+const MiB = 1024 * 1024
+
+test('data that arrives faster than a socket takes it is delivered whole, in order, and then the end', async () => {
+    const service = await startLocalService()
+    const { handler, packets } = createHandler()
+    try {
+        const socketId = await openReverseTunnel(handler, packets, service)
+        const received = []
+        let ended = false
+        // Packets of every size, as a peer sends them: a byte, a line, a
+        // block. All at once, which is how a replay arrives, and then in
+        // turns. What waits for the socket is put together on the way, and
+        // nothing may be lost, repeated or moved by that.
+        const sent = []
+        const send = i => {
+            const piece = Buffer.alloc(i % 13 === 12 ? 20000 : 1 + i * 37 % 900, i % 251)
+            sent.push(piece)
+            sendTo(handler, socketId, piece)
+        }
+        for (let i = 0; i < 4000; i++) {
+            send(i)
+        }
+        // A local endpoint that only starts to read now.
+        service.connections[0].on('data', data => received.push(data))
+        service.connections[0].on('end', () => { ended = true })
+        for (let i = 4000; i < 6000; i++) {
+            send(i)
+            if (i % 50 === 0) {
+                await breathe()
+            }
+        }
+        handler.handlePacket(ETPacketType.PORT_FORWARD_DATA,
+            encodePortForwardData({ sourceToDestination: true, socketId, closed: true }))
+
+        await waitFor(() => ended, 'the EOF to reach the local service')
+        assert.ok(Buffer.concat(received).equals(Buffer.concat(sent)), 'what arrived is not what was sent')
+    } finally {
+        handler.dispose()
+        await service.close()
+    }
+})
+
+test('a connection whose local end does not read is given up at its limit', async () => {
+    const service = await startLocalService()
+    const { handler, packets, messages, sentData } = createHandler()
+    try {
+        const socketId = await openReverseTunnel(handler, packets, service)
+        const socket = handler.destinationSockets.get(socketId)
+        const block = Buffer.alloc(64 * 1024)
+        // The kernel takes some of it, and how much is its own business.
+        for (let fed = 0; fed < 64 * MiB && !socket.destroyed; fed += block.length) {
+            sendTo(handler, socketId, block)
+            // No more is ever queued than the limit, by more than a packet.
+            assert.ok(handler.backlogOf(socket) <= MAX_LOCAL_WRITE_BACKLOG + block.length)
+            await breathe()
+        }
+        assert.equal(socket.destroyed, true, 'a connection that takes nothing was fed without end')
+        assert.deepEqual(messages.filter(x => /Closed a forwarded connection/.test(x)), [
+            'Closed a forwarded connection: the local endpoint is not reading fast enough',
+        ])
+        assert.deepEqual(sentData().map(x => [x.socketId, x.closed]), [[socketId, true]])
+    } finally {
+        handler.dispose()
+        await service.close()
+    }
+})
+
+test('all the connections of a session together are held to a limit as well', async () => {
+    const service = await startLocalService()
+    const { handler, packets, messages, sentData } = createHandler()
+    try {
+        // Each of them stays inside its own limit. There are enough of them
+        // for that to come to twice what a session may hold.
+        const count = 16
+        const socketIds = await openReverseTunnels(handler, packets, service, count)
+        const sockets = socketIds.map(socketId => handler.destinationSockets.get(socketId))
+        const total = () => sockets.filter(x => !x.destroyed).reduce((sum, x) => sum + handler.backlogOf(x), 0)
+        const closed = () => messages.filter(x => /Closed a forwarded connection/.test(x))
+        const block = Buffer.alloc(64 * 1024)
+
+        // The third is always a little ahead of the others.
+        for (let i = 0; i < 16; i++) {
+            sendTo(handler, socketIds[2], block)
+        }
+        for (let round = 0; round < 512 && !closed().length; round++) {
+            for (const socketId of socketIds) {
+                sendTo(handler, socketId, block)
+            }
+            assert.ok(total() <= MAX_TOTAL_LOCAL_WRITE_BACKLOG + block.length, `${total()} bytes were queued`)
+            await breathe()
+        }
+
+        // The one that held the most has gone, the peer has been told, and
+        // the others are as they were.
+        assert.deepEqual(closed(), [
+            'Closed a forwarded connection: too much is waiting for local endpoints that are not reading',
+        ])
+        assert.deepEqual(sockets.map(x => x.destroyed), sockets.map((_, i) => i === 2))
+        assert.deepEqual(sentData().map(x => [x.socketId, x.closed]), [[socketIds[2], true]])
+        assert.ok(sockets.every(x => handler.backlogOf(x) < MAX_LOCAL_WRITE_BACKLOG))
     } finally {
         handler.dispose()
         await service.close()

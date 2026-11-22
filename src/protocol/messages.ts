@@ -51,12 +51,24 @@ export function decodeSequenceHeader (buf: Buffer): number {
     return getInt32(decodeFields(buf, [1]), 1) ?? 0
 }
 
+/**
+ * A catch-up of `entries`, oldest first.
+ *
+ * In one piece, of the size that it comes to. A catch-up may carry millions
+ * of packets of some twenty bytes, and put together from a buffer for each
+ * tag, each length and each packet, it took twenty times its size to make.
+ */
 export function encodeCatchupBuffer (entries: Buffer[]): Buffer {
-    const w = new ProtoWriter()
-    for (const e of entries) {
-        w.bytes(1, e)
+    let size = 0
+    for (const entry of entries) {
+        size += catchupEntrySize(entry.length)
     }
-    return w.finish()
+    const catchup = Buffer.allocUnsafe(size)
+    let at = 0
+    for (const entry of entries) {
+        at = writeCatchupEntry(catchup, at, entry, 0, entry.length)
+    }
+    return catchup
 }
 
 /** What a packet of `length` bytes adds to a catch-up: its tag, its length, and itself. */
@@ -66,6 +78,23 @@ export function catchupEntrySize (length: number): number {
         prefix++
     }
     return prefix + length
+}
+
+/**
+ * Write a packet into `catchup` at `at`: its tag, its length, and itself,
+ * which is `source` from `start` to `end`. There is catchupEntrySize() of
+ * room for it. Returns where the next packet goes.
+ */
+export function writeCatchupEntry (catchup: Buffer, at: number, source: Buffer, start: number, end: number): number {
+    // Field 1, length-delimited.
+    catchup[at++] = 0x0a
+    let rest = end - start
+    while (rest >= 0x80) {
+        catchup[at++] = rest % 0x80 | 0x80
+        rest = Math.floor(rest / 0x80)
+    }
+    catchup[at++] = rest
+    return at + source.copy(catchup, at, start, end)
 }
 
 export function decodeCatchupBuffer (buf: Buffer): Buffer[] {

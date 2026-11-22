@@ -11,6 +11,7 @@ const { ETClientConnection } = load('src/protocol/connection.ts')
 const { BackedWriter } = load('src/protocol/backedWriter.ts')
 const { ETCrypto } = load('src/protocol/crypto.ts')
 const { ProtoWriter } = load('src/protocol/protobuf.ts')
+const { decodeCatchupBuffer } = load('src/protocol/messages.ts')
 const FakeEtServer = createFakeEtServer(load)
 
 const id = 'RegressionTestId'
@@ -130,7 +131,7 @@ test('the writer hands a new socket only the packets no recovery covered', () =>
 
     writer.detach()
     writer.write(TERMINAL_BUFFER, Buffer.from('b')) // disconnected: goes out in the catch-up
-    assert.equal(writer.recover(1).length, 1)
+    assert.equal(writer.recover(1).packets, 1)
     writer.write(TERMINAL_BUFFER, Buffer.from('c')) // mid-recovery: the catch-up missed it
 
     const replacement = []
@@ -142,6 +143,63 @@ test('the writer hands a new socket only the packets no recovery covered', () =>
     writer.attach({ write: frame => replacement.push(frame) })
     assert.equal(replacement.length, 1, 'attaching again must not resend')
     assert.equal(writer.sequenceNumber, 3)
+})
+
+/**
+ * Have `target[method]` fail the next time it is called, the way an allocation
+ * fails in a process that has run out of memory. Returns what puts it back.
+ */
+function failOnce (target, method) {
+    const real = target[method]
+    const restore = () => { target[method] = real }
+    target[method] = () => {
+        restore()
+        throw new RangeError('Array buffer allocation failed')
+    }
+    return restore
+}
+
+test('a packet that could not be made takes no nonce and no sequence number', () => {
+    // Whichever of the two it is that there is no memory for: the packet
+    // itself, or the room that it is kept in. The second packet is too large
+    // to share a chunk, so that room has to be made for it.
+    for (const [target, method] of [[require('tweetnacl'), 'secretbox'], [Buffer, 'allocUnsafeSlow']]) {
+        const writer = new BackedWriter(new ETCrypto(passkey, 0))
+        writer.attach({ write () {} })
+        assert.equal(writer.write(TERMINAL_BUFFER, Buffer.from('one')), true)
+        const restore = failOnce(target, method)
+        try {
+            assert.throws(() => writer.write(TERMINAL_BUFFER, Buffer.alloc(300 * 1024)), RangeError)
+        } finally {
+            restore()
+        }
+        assert.equal(writer.sequenceNumber, 1, `${method}: a packet that was never made was counted`)
+        assert.equal(writer.write(TERMINAL_BUFFER, Buffer.from('three')), true)
+
+        // The server takes each packet under the nonce that follows the last
+        // one it took. A nonce that was spent on nothing leaves it unable to
+        // take this packet, or any after it, and etserver aborts over that.
+        writer.detach()
+        const server = new ETCrypto(passkey, 0)
+        const replay = decodeCatchupBuffer(writer.recover(0).message)
+        assert.equal(replay.length, 2, `${method}: something was kept of a packet that was never made`)
+        assert.deepEqual(replay.map(packet => server.decrypt(packet.subarray(2)).toString()), ['one', 'three'])
+    }
+})
+
+test('a packet that could not be made is a packet that was dropped', () => {
+    const logger = createLogger()
+    const connection = new ETClientConnection({ host: '127.0.0.1', port: 1, id, passkey, maxReconnectAttempts: 0 }, logger)
+    const restore = failOnce(require('tweetnacl'), 'secretbox')
+    try {
+        // Not thrown at whoever is writing: a tunnel that is told of a drop
+        // closes its connection, and one that is thrown at just loses the data.
+        assert.equal(connection.writePacket(TERMINAL_BUFFER, Buffer.from('lost')), false)
+    } finally {
+        restore()
+    }
+    assert.ok(logger.lines.some(line => /Could not make an ET packet/.test(line)), logger.lines.join('\n'))
+    assert.equal(connection.writePacket(TERMINAL_BUFFER, Buffer.from('kept')), true)
 })
 
 test('shutting down during the TCP connect closes the socket that arrives late', async () => {

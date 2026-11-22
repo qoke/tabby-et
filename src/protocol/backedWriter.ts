@@ -6,23 +6,28 @@ import {
 } from './constants'
 import { UnrecoverableSessionError } from './errors'
 import { FRAME_PREFIX_SIZE, FrameLog } from './frameLog'
-import { catchupEntrySize } from './messages'
+import { catchupEntrySize, writeCatchupEntry } from './messages'
 
 // Re-exported for the existing importers: the type now lives in ./errors so that
 // crypto.ts can raise it too without a cycle (backedWriter already imports crypto).
 export { UnrecoverableSessionError } from './errors'
 
 /**
- * A packet as it goes on the wire: [length][encrypted=1][header][ciphertext].
- * The length counts what follows it, not itself. It is made where it is kept,
- * in `log`.
+ * Fill in a packet as it goes on the wire: [length][encrypted=1][header][ciphertext].
+ * The length counts what follows it, not itself, and is there already.
  */
-function framePacket (log: FrameLog, header: number, encryptedPayload: Buffer): Buffer {
-    const frame = log.add(PACKET_HEADER_SIZE + encryptedPayload.length)
+function fillFrame (frame: Buffer, header: number, encryptedPayload: Buffer): void {
     frame[FRAME_PREFIX_SIZE] = 1
     frame[FRAME_PREFIX_SIZE + 1] = header
     encryptedPayload.copy(frame, FRAME_PREFIX_SIZE + PACKET_HEADER_SIZE)
-    return frame
+}
+
+/** What the server is sent to catch it up: the packets that it says it never received. */
+export interface Catchup {
+    /** How many packets it carries. */
+    packets: number
+    /** The CatchupBuffer message that carries them, oldest first. */
+    message: Buffer
 }
 
 export class BackedWriter {
@@ -156,6 +161,11 @@ export class BackedWriter {
      *
      * `urgent` is for a control message, which is let into the room that is
      * kept for them once the rest is full.
+     *
+     * It may throw, when there is no memory to make the packet of. Then
+     * nothing has happened: no nonce is taken, no sequence number, and
+     * nothing is kept. Anything less and one failed allocation would leave
+     * the server expecting a packet that does not exist, for good.
      */
     write (header: number, payload: Buffer, urgent = false): boolean {
         // Size the serialized packet WILL have, computed without encrypting.
@@ -177,9 +187,16 @@ export class BackedWriter {
             return false
         }
 
-        // Encrypted before there is a frame for it: if that fails, nothing is
-        // kept of a packet that was never made.
-        const frame = framePacket(this.backupBuffer, header, this.crypto.encrypt(payload))
+        // Room for it first, which may not be had: nothing has been done yet.
+        // Then the cipher, which takes a nonce only if it makes a packet. If
+        // it does not, the room goes back.
+        const frame = this.backupBuffer.add(serializedLength)
+        try {
+            fillFrame(frame, header, this.crypto.encrypt(payload))
+        } catch (err) {
+            this.backupBuffer.retract(frame)
+            throw err
+        }
         this.sequenceNumber++
         if (this.unconfirmed) {
             this.unconfirmed.bytes += entry
@@ -222,8 +239,15 @@ export class BackedWriter {
         }
     }
 
-    /** Packets the peer says it never received, oldest first. */
-    recover (lastValidSequenceNumber: number): Buffer[] {
+    /**
+     * The packets the peer says it never received, as the message that
+     * carries them to it.
+     *
+     * It is written straight from where the packets are kept, in one piece.
+     * Nothing is made for any one packet: a catch-up is as many packets long
+     * as the outage was busy, and a keystroke is a packet.
+     */
+    recover (lastValidSequenceNumber: number): Catchup {
         const toRecover = this.sequenceNumber - lastValidSequenceNumber
         if (toRecover < 0) {
             throw new UnrecoverableSessionError(
@@ -235,20 +259,24 @@ export class BackedWriter {
                 'the packets the server is missing have already been trimmed from the replay buffer',
             )
         }
+        // A catch-up carries serialized packets, which is a frame less its prefix.
+        let bytes = 0
+        this.backupBuffer.eachNewest(toRecover, (_, start, end) => {
+            bytes += catchupEntrySize(end - start - FRAME_PREFIX_SIZE)
+        })
+        const message = Buffer.allocUnsafe(bytes)
+        let at = 0
+        this.backupBuffer.eachNewest(toRecover, (frames, start, end) => {
+            at = writeCatchupEntry(message, at, frames, start + FRAME_PREFIX_SIZE, end)
+        })
         // The catch-up carries everything written so far. Whatever is written
         // from here on is attach()'s to send.
         this.handedOff = this.sequenceNumber
-        // A catch-up carries serialized packets, which is a frame less its prefix.
-        const catchup = this.backupBuffer.newest(toRecover, FRAME_PREFIX_SIZE)
-        let bytes = 0
-        for (const packet of catchup) {
-            bytes += catchupEntrySize(packet.length)
-        }
         // With a socket attached this is a question, not a resume: whatever
         // asks is not going to send a catch-up over a socket that works.
         if (!this.socket) {
             this.unconfirmed = toRecover ? { from: lastValidSequenceNumber, bytes } : null
         }
-        return catchup
+        return { packets: toRecover, message }
     }
 }

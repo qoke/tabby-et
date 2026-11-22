@@ -16,7 +16,6 @@ const { ETClientConnection } = load('src/protocol/connection.ts')
 const { BackedWriter } = load('src/protocol/backedWriter.ts')
 const { ETCrypto } = load('src/protocol/crypto.ts')
 const { ETPacketType, MAX_PROTO_LENGTH } = load('src/protocol/constants.ts')
-const { encodeCatchupBuffer } = load('src/protocol/messages.ts')
 
 const MiB = 1024 * 1024
 const settle = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -339,9 +338,9 @@ function afterALongOutage () {
     }
     writer.detach()
     const catchup = writer.recover(0)
-    assert.ok(catchup.length >= 67, `a catch-up of ${catchup.length} packets`)
+    assert.ok(catchup.packets >= 67, `a catch-up of ${catchup.packets} packets`)
     writer.attach(stallable())
-    return { writer, megabyte, sent: catchup.length }
+    return { writer, megabyte, sent: catchup.packets }
 }
 
 test('a catch-up that was not seen to arrive is kept whole, whatever is written after it', () => {
@@ -350,7 +349,7 @@ test('a catch-up that was not seen to arrive is kept whole, whatever is written 
     // way and the server holding none of it.
     assert.equal(writer.write(ETPacketType.TERMINAL_BUFFER, Buffer.from('x')), true)
     writer.detach()
-    assert.equal(writer.recover(0).length, sent + 1)
+    assert.equal(writer.recover(0).packets, sent + 1)
 })
 
 test('what may have to be sent again always fits in one catch-up', () => {
@@ -362,7 +361,7 @@ test('what may have to be sent again always fits in one catch-up', () => {
     for (let i = 0; i < 100000 && writer.write(ETPacketType.PORT_FORWARD_DATA, Buffer.alloc(16), true); i++) {
         // and what has to be said of tunnels that closed
     }
-    const catchup = encodeCatchupBuffer(writer.recover(0))
+    const catchup = writer.recover(0).message
     assert.ok(catchup.length <= MAX_PROTO_LENGTH, `a catch-up of ${catchup.length} bytes, which no server accepts`)
 })
 
@@ -374,7 +373,7 @@ test('a catch-up that the server has answered is one that it has', () => {
     writer.detach()
     // Back to keeping the newest 64 MiB: the oldest have gone.
     assert.throws(() => writer.recover(0), /already been trimmed/)
-    assert.ok(writer.recover(sent + 1 - 63).length === 63)
+    assert.ok(writer.recover(sent + 1 - 63).packets === 63)
 })
 
 test('a long replay is read a slice at a time, and everything else has its turn', async () => {
