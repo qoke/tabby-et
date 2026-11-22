@@ -79,7 +79,7 @@ jobs:
       - name: Publish the verified artifact without lifecycle scripts
         run: |
           set -euo pipefail
-          package="$(find packed -maxdepth 1 -type f -name 'tabby-eternal-terminal-*.tgz' -print -quit)"
+          package="$(find ./packed -maxdepth 1 -type f -name 'tabby-eternal-terminal-*.tgz' -print -quit)"
           test -n "$package"
           metadata="$(tar -xOf "$package" package/package.json)"
           name="$(node -p "JSON.parse(process.argv[1]).name" "$metadata")"
