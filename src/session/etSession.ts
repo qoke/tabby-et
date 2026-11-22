@@ -17,7 +17,8 @@ import {
     decodeInitialResponse, decodeTerminalBuffer, encodeInitialPayload,
     encodeTerminalBuffer, encodeTerminalInfo,
 } from '../protocol/messages'
-import { ETBootstrap } from './bootstrap'
+import { ETBootstrap, ETCredentials } from './bootstrap'
+import { sanitizeLogText } from '../redact'
 import { resolveEnvironment, resolveFlag, resolvePort, resolveScripts, resolveText } from './options'
 import { ETPortForwardHandler } from './portForwarding'
 
@@ -51,6 +52,7 @@ export class ETSession extends BaseSession {
 
     private connection: ETClientConnection|null = null
     private bootstrap: ETBootstrap|null = null
+    private credentials: ETCredentials|null = null
     /** The reachability probe, while it is in flight. */
     private probe: Socket|null = null
     private keepaliveTimer: any = null
@@ -165,6 +167,7 @@ export class ETSession extends BaseSession {
             this.throwIfDestroyed()
         }
 
+        this.credentials = credentials
         this.connection = new ETClientConnection({
             host: target.host,
             port: target.port,
@@ -490,11 +493,13 @@ export class ETSession extends BaseSession {
         return []
     }
 
-    emitServiceMessage (msg: string, options?: { notify?: boolean }): void {
+    emitServiceMessage (msg: string, options?: { notify?: boolean, log?: boolean }): void {
         if (options?.notify !== false) {
             this.serviceMessage.next(msg)
         }
-        this.logger.info(stripAnsi(msg))
+        if (options?.log !== false) {
+            this.logger.info(sanitizeLogText(stripAnsi(msg), this.credentials ?? undefined))
+        }
     }
 
     // ---- keepalive --------------------------------------------------------

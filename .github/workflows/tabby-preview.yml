@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tabby_ref:
-        description: Branch or commit in qoke/tabby to package
+        description: Trusted branch (tabby-et-ssh-support) or full commit SHA in qoke/tabby to package
         required: true
         default: tabby-et-ssh-support
         type: string
@@ -27,6 +27,15 @@ jobs:
   plugin:
     runs-on: ubuntu-24.04
     steps:
+      - name: Check the requested Tabby ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TABBY_REF: ${{ inputs.tabby_ref }}
+        run: |
+          if ! printf '%s' "$TABBY_REF" | grep -Eq '^(tabby-et-ssh-support|[0-9a-f]{40})$'; then
+            echo "::error::tabby_ref must be tabby-et-ssh-support or a full 40-character commit SHA"
+            exit 1
+          fi
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -45,6 +54,7 @@ jobs:
           retention-days: 30
 
   tabby-lint:
+    needs: plugin
     runs-on: ubuntu-24.04
     steps:
       - name: Check out Tabby with SSH support

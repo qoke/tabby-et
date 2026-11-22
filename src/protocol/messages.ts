@@ -1,7 +1,7 @@
 import { MAC_BYTES } from './crypto'
 import { PACKET_HEADER_SIZE } from './constants'
 import {
-    ProtoWriter, decodeFields, getBool, getBytes, getInt32, getRepeatedBytes, getString, has, scanLengthDelimited,
+    ProtoWriter, decodeFields, getBool, getBytes, getInt32, getString, has, scanLengthDelimited,
 } from './protobuf'
 
 export interface SocketEndpoint {
@@ -17,7 +17,7 @@ export function encodeSocketEndpoint (e: SocketEndpoint): Buffer {
 }
 
 export function decodeSocketEndpoint (buf: Buffer): SocketEndpoint {
-    const m = decodeFields(buf)
+    const m = decodeFields(buf, [1, 2, 3, 4, 5])
     return { name: getString(m, 1), port: getInt32(m, 2) }
 }
 
@@ -36,7 +36,7 @@ export interface ConnectResponse {
 }
 
 export function decodeConnectResponse (buf: Buffer): ConnectResponse {
-    const m = decodeFields(buf)
+    const m = decodeFields(buf, [1, 2, 3, 4, 5])
     return { status: getInt32(m, 1), error: getString(m, 2) }
 }
 
@@ -48,7 +48,7 @@ export function encodeSequenceHeader (sequenceNumber: number): Buffer {
 }
 
 export function decodeSequenceHeader (buf: Buffer): number {
-    return getInt32(decodeFields(buf), 1) ?? 0
+    return getInt32(decodeFields(buf, [1]), 1) ?? 0
 }
 
 export function encodeCatchupBuffer (entries: Buffer[]): Buffer {
@@ -69,7 +69,13 @@ export function catchupEntrySize (length: number): number {
 }
 
 export function decodeCatchupBuffer (buf: Buffer): Buffer[] {
-    return getRepeatedBytes(decodeFields(buf), 1)
+    const out: Buffer[] = []
+    scanLengthDelimited(buf, (field, start, end) => {
+        if (field === 1) {
+            out.push(buf.subarray(start, end))
+        }
+    })
+    return out
 }
 
 /** The packets of a catch-up, oldest first, as views into the message they came in. */
@@ -108,6 +114,9 @@ export function decodeCatchupPackets (buf: Buffer): RecoveredPackets {
         }
         if (end - start < smallest) {
             throw new Error(`Malformed catch-up: a packet of ${end - start} bytes`)
+        }
+        if (buf[start] !== 1) {
+            throw new Error('Malformed catch-up: an unencrypted packet')
         }
         count++
     })
@@ -169,7 +178,7 @@ export interface InitialResponse {
 }
 
 export function decodeInitialResponse (buf: Buffer): InitialResponse {
-    const m = decodeFields(buf)
+    const m = decodeFields(buf, [1, 2, 3, 4, 5])
     return { hasError: has(m, 1), error: getString(m, 1) }
 }
 
@@ -178,7 +187,7 @@ export function encodeTerminalBuffer (data: Buffer): Buffer {
 }
 
 export function decodeTerminalBuffer (buf: Buffer): Buffer {
-    return getBytes(decodeFields(buf), 1) ?? Buffer.alloc(0)
+    return getBytes(decodeFields(buf, [1]), 1) ?? Buffer.alloc(0)
 }
 
 export interface TerminalInfo {
@@ -210,7 +219,7 @@ export function encodePortForwardDestinationRequest (r: PortForwardDestinationRe
 }
 
 export function decodePortForwardDestinationRequest (buf: Buffer): PortForwardDestinationRequest {
-    const m = decodeFields(buf)
+    const m = decodeFields(buf, [1, 2, 3, 4, 5])
     const dest = getBytes(m, 1)
     return {
         destination: dest ? decodeSocketEndpoint(dest) : {},
@@ -236,7 +245,7 @@ export function encodePortForwardDestinationResponse (r: PortForwardDestinationR
 }
 
 export function decodePortForwardDestinationResponse (buf: Buffer): PortForwardDestinationResponse {
-    const m = decodeFields(buf)
+    const m = decodeFields(buf, [1, 2, 3, 4, 5])
     return {
         clientFd: getInt32(m, 1),
         socketId: getInt32(m, 2),
@@ -269,7 +278,7 @@ export function encodePortForwardData (d: PortForwardData): Buffer {
 }
 
 export function decodePortForwardData (buf: Buffer): PortForwardData {
-    const m = decodeFields(buf)
+    const m = decodeFields(buf, [1, 2, 3, 4, 5])
     return {
         sourceToDestination: getBool(m, 1) ?? false,
         socketId: getInt32(m, 2) ?? -1,

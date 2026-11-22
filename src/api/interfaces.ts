@@ -17,6 +17,11 @@ export interface ETProfileOptions extends LoginScriptsOptions {
     // --- SSH bootstrap ---
     /** Id of an existing SSH profile to use for the bootstrap. Null = synthesise one. */
     sshProfile: string|null
+    /**
+     * Allow a linked SSH profile's password and keys to be used when the ET
+     * host differs from that profile's own host. Off by default.
+     */
+    reuseSshProfileCredentials: boolean
     /** SSH port when synthesising a profile. Ignored when sshProfile is set. */
     sshPort: number
     /** Override the remote etterminal binary path. */

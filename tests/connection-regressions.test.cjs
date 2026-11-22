@@ -10,6 +10,7 @@ const load = createLoader()
 const { ETClientConnection } = load('src/protocol/connection.ts')
 const { BackedWriter } = load('src/protocol/backedWriter.ts')
 const { ETCrypto } = load('src/protocol/crypto.ts')
+const { ProtoWriter } = load('src/protocol/protobuf.ts')
 const FakeEtServer = createFakeEtServer(load)
 
 const id = 'RegressionTestId'
@@ -231,4 +232,21 @@ test('a catch-up of empty entries is refused before anything is made of it', asy
         connection.shutdown()
         await server.close()
     }
+})
+
+test('cleartext handshake errors are not copied into persistent logs', async () => {
+    const logger = createLogger()
+    const connection = new ETClientConnection({ host: 'example.com', port: 2022, id, passkey, maxReconnectAttempts: 0 }, logger)
+    connection.writeProto = async () => {}
+    const hostile = `refused\n${id}/${passkey}\n\u001b[31msecret`
+    const payload = new ProtoWriter().int32(1, 3).string(2, hostile).finish()
+    const header = Buffer.alloc(8)
+    header.writeBigInt64LE(BigInt(payload.length))
+    const reader = { read: async size => size === 8 ? header : payload }
+
+    assert.equal(await connection.sendConnectRequest({}, reader), 3)
+    assert.equal(logger.lines.length, 1)
+    assert.match(logger.lines[0], /connection handshake/)
+    assert.doesNotMatch(logger.lines[0], /refused|RegressionTest|secret|\u001b/)
+    connection.shutdown()
 })

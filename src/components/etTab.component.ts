@@ -317,7 +317,7 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
         const title = this.etNotificationTitle
         if (text.startsWith('X ') || this.isErrorServiceMessage(text)) {
             this.notifications.error(text, title)
-        } else if (text.startsWith('~ ') || /dropped/i.test(text)) {
+        } else if (text.startsWith('~ ') || text.startsWith('Warning:') || /dropped/i.test(text)) {
             this.toastr.warning(text, title)
         } else {
             this.notifications.info(text, title)

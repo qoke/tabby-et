@@ -83,6 +83,18 @@ test('a refused remote forward stays in the form', () => {
     assert.equal(form.newForward.port, 9000)
 })
 
+test('a forward bound to the network is called out for either direction', () => {
+    const form = createForm()
+    fill(form, { type: 'Local', host: '0.0.0.0' })
+    assert.equal(form.exposesToNetwork(form.newForward), true)
+    fill(form, { type: 'Remote', host: '0.0.0.0' })
+    assert.equal(form.exposesToNetwork(form.newForward), true)
+    fill(form, { type: 'Remote', host: '127.0.0.1' })
+    assert.equal(form.exposesToNetwork(form.newForward), false)
+    fill(form, { type: 'Local', host: 'localhost' })
+    assert.equal(form.exposesToNetwork(form.newForward), false)
+})
+
 test('an imported spec keeps the tunnels that were not added', () => {
     const form = createForm()
     form.spec = '8080:80, 8081:81, 8082:82'

@@ -20,6 +20,7 @@ export class ETProfilesService extends QuickConnectProfileProvider<ETProfile> {
             user: '',
             sshPort: 22,
             sshProfile: null,
+            reuseSshProfileCredentials: false,
             etterminalPath: null,
             serverFifo: null,
             jumpServerFifo: null,
@@ -79,14 +80,18 @@ export class ETProfilesService extends QuickConnectProfileProvider<ETProfile> {
 
     /**
      * Accepts "user@host", "user@host:2022", "user@[::1]:2022", and tolerates a
-     * leading "et " or "et://" so users can paste a command line.
+     * leading "et " or "et://" so users can paste a command line. The profile
+     * name is rebuilt from the parsed target, so a password in a pasted URL is
+     * not persisted in the profile.
      */
     quickConnect (query: string): PartialProfile<ETProfile> {
         const target = parseQuickConnectQuery(query)
+        const options = { host: target.host, user: target.user, port: target.port }
+        const parsed: PartialProfile<ETProfile> = { type: 'et', name: query, options }
         return {
-            name: query,
+            name: this.intoQuickConnectString(parsed) ?? target.host,
             type: 'et',
-            options: { host: target.host, user: target.user, port: target.port },
+            options,
         }
     }
 
@@ -95,7 +100,7 @@ export class ETProfilesService extends QuickConnectProfileProvider<ETProfile> {
      * has to answer for any profile, whatever that holds: what it throws, the
      * selector does not survive.
      */
-    intoQuickConnectString (profile: ETProfile): string|null {
+    intoQuickConnectString (profile: PartialProfile<ETProfile>): string|null {
         let s = hostOf(profile)
         if (!s) {
             return null
@@ -103,11 +108,11 @@ export class ETProfilesService extends QuickConnectProfileProvider<ETProfile> {
         if (s.includes(':') && !s.startsWith('[')) {
             s = `[${s}]`
         }
-        const user = resolveUser(profile.options.user)
+        const user = resolveUser(profile.options?.user)
         if (user) {
             s = `${user}@${s}`
         }
-        const port: unknown = profile.options.port
+        const port: unknown = profile.options?.port
         if (typeof port === 'number' && Number.isInteger(port) && port !== DEFAULT_ET_PORT) {
             s = `${s}:${port}`
         }

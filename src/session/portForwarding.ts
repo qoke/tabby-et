@@ -11,6 +11,7 @@ import {
     encodePortForwardDestinationRequest, encodePortForwardDestinationResponse,
 } from '../protocol/messages'
 import { resolveFlag, resolveForwards, resolvePort } from './options'
+import { isLoopbackBindAddress } from './tunnelSpec'
 
 /**
  * Returns false when the packet had to be dropped (the ET write buffer is full).
@@ -217,7 +218,7 @@ export class ETPortForwardHandler {
     constructor (
         private logger: Logger,
         private send: Send,
-        private emitServiceMessage: (msg: string) => void,
+        private emitServiceMessage: (msg: string, options?: { log?: boolean }) => void,
         /** Is more waiting to go out than the connection can sensibly hold? */
         private congested: () => boolean = () => false,
     ) {}
@@ -279,6 +280,11 @@ export class ETPortForwardHandler {
                 })
                 this.listeners.push({ config, server })
                 this.activeForwards.push(config)
+                if (!isLoopbackBindAddress(config.host)) {
+                    this.emitServiceMessage(
+                        `Warning: ${describe(config)} is reachable from the whole network`,
+                    )
+                }
                 this.emitServiceMessage(`Forwarding ${describe(config)}`)
                 resolve()
             })
@@ -369,6 +375,11 @@ export class ETPortForwardHandler {
                 continue
             }
             requested.add(config.port)
+            if (!isLoopbackBindAddress(bindAddress)) {
+                this.emitServiceMessage(
+                    `Warning: ${describe(config)} is reachable from the remote network`,
+                )
+            }
             requests.push({
                 source: { name: bindAddress, port: config.port },
                 destination: { name: config.targetAddress, port: config.targetPort },
@@ -480,7 +491,10 @@ export class ETPortForwardHandler {
         }
         clearTimeout(entry.timer)
         if (response.hasError) {
-            this.emitServiceMessage(`Remote refused a forwarded connection: ${response.error}`)
+            // The user needs the reason; persistent logs must not receive raw
+            // server-controlled text, reflected credentials, or terminal data.
+            this.logger.warn('Remote refused a forwarded connection')
+            this.emitServiceMessage(`Remote refused a forwarded connection: ${response.error}`, { log: false })
             entry.socket.destroy()
             return
         }
@@ -632,9 +646,12 @@ export class ETPortForwardHandler {
     }
 
     private sendDestinationError (fd: number, err: Error): void {
+        // The peer needs to know the connection failed, not the local path or
+        // OS error that says why. Keep that detail in our own log.
+        this.logger.warn(`Could not open a forwarded destination: ${err.message}`)
         this.send(
             ETPacketType.PORT_FORWARD_DESTINATION_RESPONSE,
-            encodePortForwardDestinationResponse({ clientFd: fd, hasError: true, error: err.message }),
+            encodePortForwardDestinationResponse({ clientFd: fd, hasError: true, error: 'Could not open the destination' }),
             true,
         )
     }
@@ -744,7 +761,10 @@ export class ETPortForwardHandler {
             }
         })
         socket.on('end', () => this.release(role, socketId, socket, { closed: true }))
-        socket.on('error', err => this.release(role, socketId, socket, { error: err.message }))
+        socket.on('error', err => {
+            this.logger.warn(`Forwarded socket ${socketId} failed: ${err.message}`)
+            this.release(role, socketId, socket, { error: 'Local connection failed' })
+        })
         socket.on('close', () => {
             this.lingering.delete(socket)
             this.throttled.delete(socket)

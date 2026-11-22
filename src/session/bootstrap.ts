@@ -134,14 +134,14 @@ export class ETBootstrap {
             // environment variable is resolved by tabby-ssh, both during
             // start(): before it, "terminate other sessions" has no name to
             // go by, or the wrong one.
-            const command = this.buildCommand(
+            const { command, stdin } = this.buildCommand(
                 resolveUser(internals(session).authUsername ?? sshProfile.options.user) ?? '', options,
             )
-            // Redact: on the jump-host path the command embeds the real id/passkey.
+            // Credentials are sent over the channel, never in remote argv or logs.
             this.logger.debug(`Bootstrap command: ${redactCredentials(command)}`)
 
             const output = await this.orCancelled(
-                this.execAndCapture(session, command, getCaptureLimit(this.profile.options.bootstrapCaptureLimit)),
+                this.execAndCapture(session, command, getCaptureLimit(this.profile.options.bootstrapCaptureLimit), stdin),
             )
             if (!output.credentials) {
                 throw new Error(this.explainMissingMarker(output))
@@ -250,7 +250,7 @@ export class ETBootstrap {
     private buildCommand (
         user: string,
         options?: { credentials?: ETCredentials, jumpTo?: { host: string, port: number } },
-    ): string {
+    ): { command: string, stdin: string } {
         // For the destination we send an 'XXX'-prefixed id so etterminal generates its
         // own credentials. For a jump host we must send the REAL credentials the
         // destination gave us, so the jump etserver registers the same key.
@@ -277,10 +277,11 @@ export class ETBootstrap {
             args.push('--jump', `--dsthost=${options.jumpTo.host}`, `--dstport=${options.jumpTo.port}`)
         }
 
-        // TERM must not contain '_': etterminal splits the line on it.
-        const line = `${id}/${passkey}_${ET_TERM}`
-        const quoted = shellQuote.quote([binary, ...args])
-        let command = `echo '${line}' | ${quoted}`
+        // TERM must not contain '_': etterminal splits the line on it. The line
+        // goes over SSH stdin so neither the destination nor jump host exposes
+        // the real credentials in its process list or command accounting logs.
+        const stdin = `${id}/${passkey}_${ET_TERM}\n`
+        let command = shellQuote.quote([binary, ...args])
 
         if (resolveFlag(this.profile.options.killOtherSessions)) {
             // user can legitimately be empty ("ask every time") - pkill -u with a
@@ -289,7 +290,7 @@ export class ETBootstrap {
                 command = `pkill etterminal -u ${shellQuote.quote([user])}; sleep 0.5; ${command}`
             }
         }
-        return command
+        return { command, stdin }
     }
 
     /**
@@ -301,7 +302,7 @@ export class ETBootstrap {
      * the cap does not hide it, and watching for it costs a few dozen bytes.
      */
     private execAndCapture (
-        session: SSHSession, command: string, captureLimit: number,
+        session: SSHSession, command: string, captureLimit: number, stdin: string,
     ): Promise<{ stdout: string, stderr: string, credentials: ETCredentials|null }> {
         return new Promise((resolve, reject) => {
             let stdout = ''
@@ -373,6 +374,11 @@ export class ETBootstrap {
                     })
                     channel.closed$.subscribe(() => finish())
                     channel.eof$.subscribe(() => finish())
+                    await channel.write(Buffer.from(stdin))
+                    if (settled) {
+                        return
+                    }
+                    await channel.eof()
                 } catch (err) {
                     finish(err as Error)
                 }
@@ -409,14 +415,25 @@ export class ETBootstrap {
             // config.store.profiles by reference, and a ConfigProxy setter writes
             // straight through to them. Overriding host/user on a live profile
             // would permanently rewrite the user's saved SSH profile - and, since
-            // tabby-ssh looks saved passwords up by profile id, would later offer
-            // that profile's password to a different host.
+            // tabby-ssh looks saved passwords up by the profile's host and port,
+            // would later offer that profile's password to a different host.
             const all = await this.profiles.getProfiles({ clone: true })
             const found = all.find(x => x.id === linkedId && x.type === 'ssh')
             if (!found) {
                 throw new Error(`The linked SSH profile "${linkedId}" no longer exists`)
             }
             const resolved = this.profiles.getConfigProxyForProfile<SSHProfile>(found)
+            const linkedHost = resolveText(found.options?.host)
+            // A profile's credentials belong to its own host. Using them for a
+            // different host is a deliberate choice, not something a pasted or
+            // imported ET profile should be able to make silently.
+            if (host && linkedHost && linkedHost.toLowerCase() !== host.toLowerCase()
+                && !resolveFlag(o.reuseSshProfileCredentials)) {
+                throw new Error(
+                    `The linked SSH profile "${found.name}" is for ${linkedHost}, but this session is for ${host}. `
+                    + 'Enable "Reuse SSH profile credentials for a different host" in this profile to use its credentials there.',
+                )
+            }
             // The ET profile's host/user win when set, so one SSH profile can serve
             // several ET hosts in the same network.
             if (host) {

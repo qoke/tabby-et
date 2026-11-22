@@ -1,5 +1,5 @@
 import { ByteReader } from './byteReader'
-import { ETCrypto } from './crypto'
+import { ETCrypto, MAC_BYTES } from './crypto'
 import { MAX_ENCRYPTED_PACKET_LENGTH, PACKET_HEADER_SIZE } from './constants'
 import { RecoveredPackets } from './messages'
 
@@ -35,6 +35,17 @@ export class BackedReader {
      */
     revive (reader: ByteReader, recovered: Buffer[]|RecoveredPackets): void {
         this.reader = reader
+        // Validate before counting. A malformed entry must not claim a packet
+        // that the server will then decline to replay: the sequence count would
+        // be ahead of the nonce count, and every later packet would fail its
+        // authentication check. RecoveredPackets was validated by
+        // decodeCatchupPackets(); a plain Buffer[] may come from a test or a
+        // caller that has not.
+        if (Array.isArray(recovered)) {
+            for (const packet of recovered) {
+                this.validate(packet)
+            }
+        }
         // Kept as it came, and never spread into a call. A replay is as long
         // as the outage was busy, and spreading one overflows the stack
         // somewhere past a hundred thousand packets - on every attempt, so that
@@ -82,8 +93,10 @@ export class BackedReader {
         if (!frame) {
             return null
         }
+        const serialized = frame.subarray(4)
+        this.validate(serialized)
         this.sequenceNumber++
-        return this.parse(frame.subarray(4))
+        return this.parse(serialized)
     }
 
     /** Read one packet: recovery queue first, then the socket. */
@@ -100,17 +113,29 @@ export class BackedReader {
             throw new Error(`Invalid ET packet length ${length}`)
         }
         const serialized = await this.reader.read(length)
+        this.validate(serialized)
         this.sequenceNumber++
         return this.parse(serialized)
     }
 
-    private parse (serialized: Buffer): ETPacket {
-        const encrypted = serialized[0]
-        const header = serialized[1]
-        const payload = serialized.subarray(PACKET_HEADER_SIZE)
-        if (!encrypted) {
+    /**
+     * A serialized packet must be long enough to hold its header and MAC, and
+     * must say that it is encrypted. Checked before the sequence is advanced:
+     * a frame that cannot be decrypted must not be counted as received.
+     */
+    private validate (serialized: Buffer): void {
+        if (serialized[0] !== 1) {
             throw new Error('Received an unencrypted ET packet on the encrypted stream')
         }
+        if (serialized.length < PACKET_HEADER_SIZE + MAC_BYTES) {
+            throw new Error(`Invalid ET packet: ${serialized.length} bytes is shorter than a packet header and MAC`)
+        }
+    }
+
+    private parse (serialized: Buffer): ETPacket {
+        this.validate(serialized)
+        const header = serialized[1]
+        const payload = serialized.subarray(PACKET_HEADER_SIZE)
         return { header, payload: this.crypto.decrypt(payload) }
     }
 }

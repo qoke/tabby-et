@@ -198,15 +198,21 @@ export function scanLengthDelimited (buf: Buffer, visit: (field: number, start: 
 
 /**
  * Decode a message into field number -> occurrences.
- * Unknown fields are retained (harmless) rather than rejected, matching protobuf rules.
+ *
+ * Network messages MUST name their singular fields. Then only the first
+ * occurrence of each declared field gets a field object and list storage;
+ * unknown and subsequent occurrences are parsed and passed over. The default
+ * keeps every occurrence, for small trusted messages and repeated fields.
  */
-export function decodeFields (buf: Buffer): DecodedMessage {
+export function decodeFields (buf: Buffer, singularFields?: readonly number[]): DecodedMessage {
+    const singular = singularFields ? new Set(singularFields) : null
     const out: DecodedMessage = new Map()
+    const retain = (field: number): boolean => !singular || singular.has(field) && !out.has(field)
     const add = (field: number, value: DecodedField) => {
         const list = out.get(field)
-        if (list) {
+        if (list && !singular) {
             list.push(value)
-        } else {
+        } else if (!list) {
             out.set(field, [value])
         }
     }
@@ -226,7 +232,9 @@ export function decodeFields (buf: Buffer): DecodedMessage {
         if (wireType === WIRE_VARINT) {
             const [value, len] = readVarint(buf, offset)
             offset += len
-            add(field, { wireType, varint: value })
+            if (retain(field)) {
+                add(field, { wireType, varint: value })
+            }
         } else if (wireType === WIRE_LEN) {
             const [lenValue, lenLen] = readVarint(buf, offset)
             offset += lenLen
@@ -238,19 +246,25 @@ export function decodeFields (buf: Buffer): DecodedMessage {
             if (offset + len > buf.length) {
                 throw new Error('Truncated protobuf length-delimited field')
             }
-            add(field, { wireType, bytes: buf.subarray(offset, offset + len) })
+            if (retain(field)) {
+                add(field, { wireType, bytes: buf.subarray(offset, offset + len) })
+            }
             offset += len
         } else if (wireType === WIRE_FIXED64) {
             if (offset + 8 > buf.length) {
                 throw new Error('Truncated protobuf fixed64 field')
             }
-            add(field, { wireType, bytes: buf.subarray(offset, offset + 8) })
+            if (retain(field)) {
+                add(field, { wireType, bytes: buf.subarray(offset, offset + 8) })
+            }
             offset += 8
         } else if (wireType === WIRE_FIXED32) {
             if (offset + 4 > buf.length) {
                 throw new Error('Truncated protobuf fixed32 field')
             }
-            add(field, { wireType, bytes: buf.subarray(offset, offset + 4) })
+            if (retain(field)) {
+                add(field, { wireType, bytes: buf.subarray(offset, offset + 4) })
+            }
             offset += 4
         } else {
             throw new Error(`Unsupported protobuf wire type ${wireType}`)

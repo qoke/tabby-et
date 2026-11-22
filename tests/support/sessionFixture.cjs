@@ -24,6 +24,8 @@ function createSessionFixture () {
             this.authUsername = null
             this.started = false
             this.destroyed = false
+            this.inputs = []
+            this.eofCount = 0
             ssh.sessions.push(this)
         }
 
@@ -40,7 +42,11 @@ function createSessionFixture () {
             this.id = ssh.uniqueIds ? `RegressionTest${String(ssh.issued++).padStart(2, '0')}` : id
             const data$ = new ReplaySubject(1)
             data$.next(Buffer.from(`motd noise\nIDPASSKEY:${this.id}/${passkey}\n`))
-            return { data$, extendedData$: new Subject(), closed$: new Subject(), eof$: new Subject() }
+            return {
+                data$, extendedData$: new Subject(), closed$: new Subject(), eof$: new Subject(),
+                write: async data => { this.inputs.push(Buffer.from(data).toString()) },
+                eof: async () => { this.eofCount++ },
+            }
         }
 
         async destroy () {

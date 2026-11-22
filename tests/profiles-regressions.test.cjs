@@ -55,6 +55,22 @@ test('what is typed to connect is read as it was meant', () => {
     assert.deepEqual(read('ET  alice@example.org'), { host: 'example.org', user: 'alice', port: 2022 })
 })
 
+test('a password in userinfo is not kept as a username or profile name', () => {
+    assert.deepEqual(
+        parseQuickConnectQuery('et://alice:secret@example.org'),
+        { host: 'example.org', user: 'alice', port: 2022 },
+    )
+    assert.deepEqual(
+        parseQuickConnectQuery('et -u alice:secret example.org'),
+        { host: 'example.org', user: 'alice', port: 2022 },
+    )
+    const quick = provider.quickConnect('et://alice:secret@example.org')
+    assert.equal(quick.name, 'alice@example.org')
+    assert.equal(quick.options.user, 'alice')
+    assert.doesNotMatch(quick.name, /secret/)
+    assert.equal(provider.configDefaults.options.reuseSshProfileCredentials, false)
+})
+
 test('what could always be typed to connect still can', () => {
     const read = query => parseQuickConnectQuery(query)
     assert.deepEqual(read('example.org'), { host: 'example.org', user: undefined, port: 2022 })

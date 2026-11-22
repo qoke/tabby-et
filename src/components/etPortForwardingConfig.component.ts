@@ -62,12 +62,13 @@ export class ETPortForwardingConfigComponent implements DoCheck {
     }
 
     /**
-     * A Local forward binding a non-loopback address publishes the tunnel to the
-     * whole network - anyone who can reach this machine gets to use it. Only
-     * Local forwards bind here; a Remote forward's `host` is bound by etserver.
+     * A forward bound to a non-loopback address is reachable from the network
+     * at the machine where it is bound. For a Local forward that is this
+     * machine; for a Remote forward it is the ET server's machine, and the
+     * tunnel still ends at this machine's localhost.
      */
     exposesToNetwork (fw: ForwardedPortConfig): boolean {
-        return fw.type === PortForwardType.Local && !isLoopbackBindAddress(fw.host)
+        return !isLoopbackBindAddress(fw.host)
     }
 
     reset (): void {

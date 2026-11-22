@@ -385,6 +385,39 @@ test('a catch-up is read without an object for every entry', () => {
     assert.throws(() => decodeCatchupPackets(Buffer.from([0x0a, 0x7f, 0x01])), /Truncated|catch-up/i)
 })
 
+test('ordinary packets do not retain repeated or unknown fields', () => {
+    const script = `
+        const { createLoader } = require(${JSON.stringify(path.join(__dirname, 'support/load.cjs'))})
+        const load = createLoader()
+        const { decodeTerminalBuffer, encodeTerminalBuffer } = load('src/protocol/messages.ts')
+        const { decodeFields } = load('src/protocol/protobuf.ts')
+        const hostile = Buffer.alloc(1024 * 1024)
+        for (let i = 0; i < hostile.length; i += 4) {
+            hostile[i] = 0x0a // A repeated known field 1, length-delimited, empty.
+            hostile[i + 2] = 0x12 // An unknown field 2, also empty.
+        }
+        const expected = Buffer.from('terminal bytes')
+        gc()
+        const before = process.memoryUsage().heapUsed
+        const decoded = decodeTerminalBuffer(Buffer.concat([encodeTerminalBuffer(expected), hostile]))
+        // Measure before GC: the old decoder's temporary map was large enough to OOM the renderer.
+        const held = process.memoryUsage().heapUsed - before
+        const fields = decodeFields(hostile, [1])
+        process.stdout.write(JSON.stringify({
+            held, correct: decoded.equals(expected), fields: fields.size,
+            occurrences: fields.get(1).length, firstLength: fields.get(1)[0].bytes.length,
+        }))
+    `
+    const child = spawnSync(process.execPath, ['--expose-gc', '-e', script], { timeout: 30000, maxBuffer: 1 << 20 })
+    assert.equal(child.status, 0, child.stderr.toString())
+    const outcome = JSON.parse(child.stdout.toString())
+    assert.equal(outcome.correct, true)
+    assert.equal(outcome.fields, 1)
+    assert.equal(outcome.occurrences, 1)
+    assert.equal(outcome.firstLength, 0)
+    assert.ok(outcome.held < 8 * 1024 * 1024, `decoding used ${inMiB(outcome.held)} of heap`)
+})
+
 test('a compact catch-up is revived and read like any other', async () => {
     const { decodeCatchupPackets, encodeCatchupBuffer } = load('src/protocol/messages.ts')
     const packets = serverPackets(12)
@@ -478,4 +511,48 @@ test('a length that cannot be one is left for the read that says so', async () =
     socket.emit('data', nonsense)
     assert.equal(reader.poll(), null)
     await assert.rejects(reader.read(), /Invalid ET packet length/)
+})
+
+test('a frame that cannot be decrypted is refused before it is counted', () => {
+    const socket = createSocket()
+    const reader = new BackedReader(new ETCrypto(passkey, 1))
+    reader.attach(new ByteReader(socket))
+
+    const unencrypted = Buffer.alloc(6)
+    unencrypted.writeInt32BE(2, 0)
+    unencrypted[4] = 0
+    unencrypted[5] = 1
+    socket.emit('data', unencrypted)
+    assert.throws(() => reader.poll(), /unencrypted/)
+    assert.equal(reader.sequenceNumber, 0)
+
+    const short = Buffer.alloc(4 + 2 + 1)
+    short.writeInt32BE(3, 0)
+    short[4] = 1
+    short[5] = 1
+    socket.emit('data', short)
+    assert.throws(() => reader.poll(), /shorter than a packet header and MAC/)
+    assert.equal(reader.sequenceNumber, 0)
+
+    const encrypted = new ETCrypto(passkey, 1).encrypt(Buffer.from('ok'))
+    const valid = Buffer.alloc(4 + 2 + encrypted.length)
+    valid.writeInt32BE(2 + encrypted.length, 0)
+    valid[4] = 1
+    valid[5] = 1
+    encrypted.copy(valid, 6)
+    socket.emit('data', valid)
+    assert.equal(reader.poll().payload.toString(), 'ok')
+    assert.equal(reader.sequenceNumber, 1)
+})
+
+test('a catch-up entry that cannot be decrypted is refused before it is counted', () => {
+    const { decodeCatchupPackets } = load('src/protocol/messages.ts')
+    const entry = Buffer.alloc(18)
+    entry[0] = 0
+    entry[1] = 1
+    const message = Buffer.concat([Buffer.from([0x0a, 0x12]), entry])
+    assert.throws(() => decodeCatchupPackets(message), /unencrypted/)
+    const reader = new BackedReader(new ETCrypto(passkey, 1))
+    assert.throws(() => reader.revive(new ByteReader(createSocket()), [entry]), /unencrypted/)
+    assert.equal(reader.sequenceNumber, 0)
 })

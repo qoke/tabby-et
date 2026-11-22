@@ -17,10 +17,12 @@ export function isLoopbackBindAddress (host: string): boolean {
         return false
     }
     const h = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
+    const ipv4Loopback = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h)
+    const octets = ipv4Loopback?.slice(1).map(Number)
     return h === 'localhost'
         || h === '::1'
         || h === '0:0:0:0:0:0:0:1'
-        || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)
+        || (octets !== undefined && octets.every(octet => octet <= 255))
 }
 
 function parsePort (s: string): number {

@@ -32,8 +32,8 @@ TABBY_DIR=/path/to/tabby npm run typecheck
 xvfb-run -a node scripts/smoke-tabby.mjs --tabby /path/to/tabby --plugin /path/to/unpacked/tabby-eternal-terminal
 ```
 
-`npm pack` and `npm publish` build the bundle themselves, through `prepack`.
-The package has to hold these four files and nothing else:
+`npm pack` and a local `npm publish` build the bundle themselves, through `prepack`.
+The workflow instead builds and tests in an unprivileged job, then publishes the resulting tarball with lifecycle scripts disabled. The package has to hold these four files and nothing else:
 
 ```
 LICENSE
@@ -84,11 +84,17 @@ publishes nothing.
 
 ## Trusting the publish workflow
 
-Once the package exists, npm can be told to trust the workflow. From the
-command line, with npm 11.15 or later, logged in as an owner of the package:
+Once the package exists, npm can be told to trust the workflow. First create a
+`release` environment in the GitHub repository settings. Require approval from
+the release owners and restrict deployments to protected release tags. Protect
+`v*` tags with a repository ruleset so only those owners can create or update them.
+The publish job also refuses a tag whose commit is not already on `main`.
+
+Then configure the same environment on npm. From the command line, with npm
+11.15 or later, logged in as an owner of the package:
 
 ```sh
-npm trust github tabby-eternal-terminal --file publish.yml --repository qoke/tabby-et --allow-publish
+npm trust github tabby-eternal-terminal --file publish.yml --repository qoke/tabby-et --environment release --allow-publish
 npm trust list tabby-eternal-terminal
 ```
 
@@ -100,7 +106,7 @@ Publisher, and choose GitHub Actions:
 | Organization or user | `qoke` |
 | Repository | `tabby-et` |
 | Workflow filename | `publish.yml` |
-| Environment name | leave empty |
+| Environment name | `release` |
 
 The filename is that of `.github/workflows/publish.yml`, without its
 directory. If the file is renamed, npm has to be told the new name. A package
@@ -121,9 +127,11 @@ git tag -a "v$(node -p "require('./package.json').version")" -m "tabby-eternal-t
 git push origin --tags
 ```
 
-The workflow checks that the tag is the version in `package.json`, runs the
-tests, builds, and publishes with provenance. Started by hand from the Actions
-tab, it does all of that except publish.
+The workflow checks that the tag is the version in `package.json` and that its
+commit is on `main`. Tests and packaging run without an OIDC token. After approval
+of the `release` environment, a separate job publishes the verified tarball with
+provenance and without running lifecycle scripts. Started by hand from the Actions
+tab, it produces only the package artifact and has no publishing credential.
 
 Only tags of the form `v1.2.3` start it. A pre-release is published by hand,
 under a tag of its own, so that `latest` stays what Tabby should install:

@@ -180,9 +180,11 @@ test('bootstrap capture never exceeds its byte cap', async () => {
         extendedData$: { subscribe (fn) { stderrHandler = fn } },
         closed$: { subscribe () {} },
         eof$: { subscribe (fn) { eofHandler = fn } },
+        write: async () => {},
+        eof: async () => {},
     }
     const session = { openExecChannel: async () => channel }
-    const result = ETBootstrap.prototype.execAndCapture.call({}, session, 'test', 10)
+    const result = ETBootstrap.prototype.execAndCapture.call({}, session, 'test', 10, 'test-input\n')
     await new Promise(resolve => setImmediate(resolve))
     dataHandler(Buffer.alloc(100, 'a'))
     stderrHandler([1, Buffer.alloc(100, 'b')])

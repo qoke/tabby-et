@@ -9,7 +9,7 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
-  # Started by hand, it does everything but publish.
+  # Started by hand, it builds and tests the package without publishing it.
   workflow_dispatch:
 
 permissions:
@@ -20,50 +20,74 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  # Dependencies, tests, build scripts, and prepack must never receive the npm
+  # publishing identity. A manual run stops here, with an inspectable artifact.
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
+      id-token: none
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
           cache: npm
-      - name: Use an npm that can do trusted publishing
-        run: npm install --global npm@^11.5.1
-      - name: Check that the tag is the version in package.json
-        if: github.event_name == 'push'
-        run: |
-          version="$(node -p "require('./package.json').version")"
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::The tag is $GITHUB_REF_NAME, but package.json says $version"
-            exit 1
-          fi
       - run: npm ci
       - run: npm test
       - run: npm run build
       - run: npm run check:bundle
-      - name: Show what the package holds
-        run: npm pack --dry-run
-      - name: Decide whether to publish
-        id: decide
-        env:
-          EVENT: ${{ github.event_name }}
+      - name: Package without running lifecycle scripts
+        run: npm pack --ignore-scripts --pack-destination packed
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tabby-eternal-terminal-package
+          path: packed/*.tgz
+          if-no-files-found: error
+          retention-days: 5
+
+  # The release environment requires approval before this job and its OIDC
+  # credential become available. It runs no repository or dependency scripts.
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Require the tagged commit to be on main
         run: |
-          name="$(node -p "require('./package.json').name")"
-          version="$(node -p "require('./package.json').version")"
-          if [ "$EVENT" != "push" ]; then
-            echo "Started by hand: nothing is published."
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          elif [ -n "$(npm view "$name@$version" version 2> /dev/null)" ]; then
-            echo "::notice::$name@$version is on npm already; nothing is published."
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "${GITHUB_SHA}^{commit}" FETCH_HEAD
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tabby-eternal-terminal-package
+          path: packed
+      - name: Use an npm that supports trusted publishing
+        run: npm install --global npm@11.20.0
+      - name: Publish the verified artifact without lifecycle scripts
+        run: |
+          set -euo pipefail
+          package="$(find packed -maxdepth 1 -type f -name 'tabby-eternal-terminal-*.tgz' -print -quit)"
+          test -n "$package"
+          metadata="$(tar -xOf "$package" package/package.json)"
+          name="$(node -p "JSON.parse(process.argv[1]).name" "$metadata")"
+          version="$(node -p "JSON.parse(process.argv[1]).version" "$metadata")"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag is $GITHUB_REF_NAME, but package.json says $version"
+            exit 1
           fi
-      - name: Publish
-        if: steps.decide.outputs.publish == 'true'
-        run: npm publish --access public
+          if [ -n "$(npm view "$name@$version" version 2> /dev/null)" ]; then
+            echo "::notice::$name@$version is on npm already; nothing is published."
+            exit 0
+          fi
+          npm publish "$package" --access public --ignore-scripts

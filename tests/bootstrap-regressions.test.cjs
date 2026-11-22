@@ -23,7 +23,10 @@ class SSHSession {
         if (ssh.openExecChannel) {
             return ssh.openExecChannel()
         }
-        return { data$: new Subject(), extendedData$: new Subject(), closed$: new Subject(), eof$: new Subject() }
+        return {
+            data$: new Subject(), extendedData$: new Subject(), closed$: new Subject(), eof$: new Subject(),
+            write: async () => {}, eof: async () => {},
+        }
     }
 
     async destroy () {
@@ -52,6 +55,7 @@ function createBootstrap (options = {}, globals = {}) {
             user: 'tester',
             sshPort: 22,
             sshProfile: null,
+            reuseSshProfileCredentials: false,
             etterminalPath: null,
             serverFifo: null,
             killOtherSessions: false,
@@ -64,8 +68,8 @@ function createBootstrap (options = {}, globals = {}) {
 
 /** What the remote shell will run, as argv, without the credentials piped into it. */
 function commandFor (options, globals) {
-    const command = createBootstrap(options, globals).buildCommand('tester')
-    return shellQuote.parse(command.replace(/^echo '[^']*' \| /, '')).join(' ')
+    const command = createBootstrap(options, globals).buildCommand('tester').command
+    return shellQuote.parse(command).join(' ')
 }
 
 test('a cleared etterminal path falls through to the next default', () => {
@@ -158,11 +162,60 @@ test('the bootstrap is given the host that the probe reached', async () => {
 
     // A linked SSH profile keeps its own settings, and takes the ET host.
     ssh.linked = [{ id: 'ssh:linked', type: 'ssh', name: 'linked', options: { host: 'bastion', user: 'root', port: 22 } }]
-    profile = await createBootstrap({ host: ' example.com ', user: '   ', sshProfile: 'ssh:linked' })
+    profile = await createBootstrap({ host: ' example.com ', user: '   ', sshProfile: 'ssh:linked', reuseSshProfileCredentials: true })
         .resolveSSHProfile('destination')
     assert.equal(profile.options.host, 'example.com')
     assert.equal(profile.options.user, 'root', 'a blank user replaced the linked profile\'s user')
     ssh.linked = []
+})
+
+test('a linked SSH profile is not used for a different host without consent', async () => {
+    ssh.linked = [{ id: 'ssh:linked', type: 'ssh', name: 'linked', options: { host: 'bastion', user: 'root', port: 22, password: 'secret' } }]
+    try {
+        await assert.rejects(
+            createBootstrap({ host: 'example.com', sshProfile: 'ssh:linked', reuseSshProfileCredentials: false })
+                .resolveSSHProfile('destination'),
+            /linked.*bastion.*example\.com/,
+        )
+    } finally {
+        ssh.linked = []
+    }
+})
+
+test('a linked SSH profile can be used for a different host with consent', async () => {
+    ssh.linked = [{ id: 'ssh:linked', type: 'ssh', name: 'linked', options: { host: 'bastion', user: 'root', port: 22, password: 'secret' } }]
+    try {
+        const profile = await createBootstrap({ host: 'example.com', sshProfile: 'ssh:linked', reuseSshProfileCredentials: true })
+            .resolveSSHProfile('destination')
+        assert.equal(profile.options.host, 'example.com')
+        assert.equal(profile.options.password, 'secret')
+    } finally {
+        ssh.linked = []
+    }
+})
+
+test('a linked SSH profile for the same host needs no consent', async () => {
+    ssh.linked = [{ id: 'ssh:linked', type: 'ssh', name: 'linked', options: { host: 'example.com', user: 'root', port: 22 } }]
+    try {
+        const profile = await createBootstrap({ host: 'example.com', sshProfile: 'ssh:linked', reuseSshProfileCredentials: false })
+            .resolveSSHProfile('destination')
+        assert.equal(profile.options.host, 'example.com')
+    } finally {
+        ssh.linked = []
+    }
+})
+
+test('a linked jump SSH profile for a different host needs consent too', async () => {
+    ssh.linked = [{ id: 'ssh:jump', type: 'ssh', name: 'jump', options: { host: 'old-name', user: 'jump-admin', port: 22 } }]
+    try {
+        await assert.rejects(
+            createBootstrap({ host: 'dest', jumpHost: 'jump.example.com', jumpSshProfile: 'ssh:jump', reuseSshProfileCredentials: false })
+                .resolveSSHProfile('jump'),
+            /jump.*old-name.*jump\.example\.com/,
+        )
+    } finally {
+        ssh.linked = []
+    }
 })
 
 // ---- an SSH session with Tabby's own lifecycle ------------------------------
@@ -181,6 +234,8 @@ function createTabbyLikeSSH () {
             this.authUsername = null
             this.disconnects = 0
             this.commands = []
+            this.inputs = []
+            this.eofCount = 0
             this.serviceMessage$ = new Subject()
             this.keyboardInteractivePrompt$ = new Subject()
             this.willDestroy$ = new Subject()
@@ -208,7 +263,11 @@ function createTabbyLikeSSH () {
             this.commands.push(command)
             const data$ = new Subject()
             setImmediate(() => data$.next(Buffer.from('IDPASSKEY:RegressionTestId/RegressionTestPasskey00000000000\n')))
-            return { data$, extendedData$: new Subject(), closed$: new Subject(), eof$: new Subject() }
+            return {
+                data$, extendedData$: new Subject(), closed$: new Subject(), eof$: new Subject(),
+                write: async data => { this.inputs.push(Buffer.from(data).toString()) },
+                eof: async () => { this.eofCount++ },
+            }
         }
 
         async destroy () {
@@ -233,8 +292,8 @@ function createTabbyLikeSSH () {
         ])
         return new bootstrapModule.ETBootstrap({ get: token => services.get(token) }, {
             options: {
-                host: 'example.com', user: 'tester', sshPort: 22, sshProfile: null, etterminalPath: null,
-                serverFifo: null, killOtherSessions: false, verbose: 0, bootstrapCaptureLimit: null, ...options,
+                host: 'example.com', user: 'tester', sshPort: 22, sshProfile: null, reuseSshProfileCredentials: false,
+                etterminalPath: null, serverFifo: null, killOtherSessions: false, verbose: 0, bootstrapCaptureLimit: null, ...options,
             },
         })
     }
@@ -289,7 +348,7 @@ test('other sessions are terminated for the user who logged in', async () => {
     const world = createTabbyLikeSSH()
     world.prompted = 'typed-at-the-prompt'
     await world.create({ user: '', killOtherSessions: true }).run()
-    assert.match(world.sessions[0].commands[0], /^pkill etterminal -u typed-at-the-prompt; sleep 0\.5; echo /)
+    assert.match(world.sessions[0].commands[0], /^pkill etterminal -u typed-at-the-prompt; sleep 0\.5; etterminal /)
 
     process.env.ET_TEST_LOGIN = 'from-the-environment'
     try {
@@ -311,7 +370,7 @@ test('a linked SSH profile is reached through its jump host', async () => {
         { id: 'ssh:office', type: 'ssh', name: 'office', options: { host: 'office', user: 'me', port: 2200, jumpHost: 'ssh:bastion' } },
         { id: 'ssh:bastion', type: 'ssh', name: 'bastion', options: { host: 'bastion.example.com', user: 'gate', port: 22 } },
     ]
-    const credentials = await world.create({ host: 'et.internal', user: '', sshProfile: 'ssh:office' }).run()
+    const credentials = await world.create({ host: 'et.internal', user: '', sshProfile: 'ssh:office', reuseSshProfileCredentials: true }).run()
     assert.equal(credentials.id, 'RegressionTestId')
 
     const [bastion, destination] = world.sessions
@@ -338,7 +397,7 @@ test('jump hosts are followed along the whole chain', async () => {
         { id: 'ssh:inner', type: 'ssh', name: 'inner', options: { host: 'inner', user: 'me', port: 22, jumpHost: 'ssh:outer' } },
         { id: 'ssh:outer', type: 'ssh', name: 'outer', options: { host: 'outer', user: 'me', port: 22 } },
     ]
-    await world.create({ host: 'et.internal', sshProfile: 'ssh:office' }).run()
+    await world.create({ host: 'et.internal', sshProfile: 'ssh:office', reuseSshProfileCredentials: true }).run()
     assert.deepEqual(world.sessions.map(x => x.profile.options.host), ['outer', 'inner', 'et.internal'])
     assert.equal(world.sessions[0].forwardedTo.addressToConnectTo, 'inner')
     assert.equal(world.sessions[1].forwardedTo.addressToConnectTo, 'et.internal')
@@ -351,14 +410,14 @@ test('a jump host that is missing, or that leads back to itself, is an error', a
     world.profiles = [
         { id: 'ssh:office', type: 'ssh', name: 'office', options: { host: 'office', user: 'me', jumpHost: 'ssh:gone' } },
     ]
-    await assert.rejects(world.create({ sshProfile: 'ssh:office' }).run(), /jump host .*ssh:gone.* (not found|no longer exists)/i)
+    await assert.rejects(world.create({ sshProfile: 'ssh:office', reuseSshProfileCredentials: true }).run(), /jump host .*ssh:gone.* (not found|no longer exists)/i)
     assert.equal(world.sessions.length, 0)
 
     world.profiles = [
         { id: 'ssh:a', type: 'ssh', name: 'a', options: { host: 'a', user: 'me', jumpHost: 'ssh:b' } },
         { id: 'ssh:b', type: 'ssh', name: 'b', options: { host: 'b', user: 'me', jumpHost: 'ssh:a' } },
     ]
-    await assert.rejects(world.create({ sshProfile: 'ssh:a' }).run(), /loop/i)
+    await assert.rejects(world.create({ sshProfile: 'ssh:a', reuseSshProfileCredentials: true }).run(), /loop/i)
     assert.equal(world.sessions.length, 0)
 })
 
@@ -373,7 +432,7 @@ test('a jump host that fails takes nothing down with it but the bootstrap', asyn
             throw new Error('Authentication rejected')
         }
     }
-    await assert.rejects(world.create({ host: 'et.internal', sshProfile: 'ssh:office' }).run(), /Authentication rejected/)
+    await assert.rejects(world.create({ host: 'et.internal', sshProfile: 'ssh:office', reuseSshProfileCredentials: true }).run(), /Authentication rejected/)
     assert.equal(world.sessions[0].disconnects > 0, true, 'the jump host connection was left open')
 })
 
@@ -385,6 +444,7 @@ test('a linked jump host profile keeps its own user', async () => {
     ]
     const bootstrap = world.create({
         host: 'dest.example.com', user: 'app-user', jumpHost: 'jump.example.com', jumpSshProfile: 'ssh:jump', sshProfile: 'ssh:dest',
+        reuseSshProfileCredentials: true,
     })
     const jump = await bootstrap.resolveSSHProfile('jump')
     assert.equal(jump.options.user, 'jump-admin', 'the jump host would be logged into as the destination user')
@@ -405,10 +465,13 @@ test('a linked jump host profile keeps its own user', async () => {
 function capture (limit) {
     const data$ = new Subject()
     const extendedData$ = new Subject()
-    const channel = { data$, extendedData$, closed$: new Subject(), eof$: new Subject() }
+    const channel = {
+        data$, extendedData$, closed$: new Subject(), eof$: new Subject(),
+        write: async () => {}, eof: async () => {},
+    }
     const session = { openExecChannel: async () => channel }
     const bootstrap = createBootstrap({ bootstrapCaptureLimit: limit })
-    return { channel, result: bootstrap.execAndCapture(session, 'test', limit), ready: settle(5) }
+    return { channel, result: bootstrap.execAndCapture(session, 'test', limit, 'test-input\n'), ready: settle(5) }
 }
 
 test('the session key is found however much was printed before it', async () => {
@@ -440,7 +503,10 @@ test('a bootstrap whose output fills the cap still connects', async () => {
             data$.next(Buffer.alloc(2048, 0x2e))
             data$.next(Buffer.from('IDPASSKEY:RegressionTestId/RegressionTestPasskey00000000000\n'))
         })
-        return { data$, extendedData$: new Subject(), closed$: new Subject(), eof$: new Subject() }
+        return {
+            data$, extendedData$: new Subject(), closed$: new Subject(), eof$: new Subject(),
+            write: async () => {}, eof: async () => {},
+        }
     }
     try {
         const credentials = await createBootstrap({ bootstrapCaptureLimit: 1024 }).run()
@@ -452,11 +518,11 @@ test('a bootstrap whose output fills the cap still connects', async () => {
 
 test('other sessions are terminated when the profile says so, and not when it says no', () => {
     for (const killOtherSessions of [true, 'true', 'yes', 'on']) {
-        assert.match(createBootstrap({ killOtherSessions }).buildCommand('tester'), /^pkill etterminal -u tester; /)
+        assert.match(createBootstrap({ killOtherSessions }).buildCommand('tester').command, /^pkill etterminal -u tester; /)
     }
     for (const killOtherSessions of [false, 'false', 'no', 'off', '0', null, undefined, 0]) {
         assert.doesNotMatch(
-            createBootstrap({ killOtherSessions }).buildCommand('tester'), /pkill/, JSON.stringify(killOtherSessions),
+            createBootstrap({ killOtherSessions }).buildCommand('tester').command, /pkill/, JSON.stringify(killOtherSessions),
         )
     }
 })
@@ -485,7 +551,7 @@ test("the port forwards of a linked profile are its own, and not the bootstrap's
         { id: 'ssh:office', type: 'ssh', name: 'office', options: { host: 'office', user: 'me', port: 22, jumpHost: 'ssh:bastion', forwardedPorts: [forward] } },
         { id: 'ssh:bastion', type: 'ssh', name: 'bastion', options: { host: 'bastion', user: 'gate', port: 22, forwardedPorts: [forward] } },
     ]
-    await world.create({ host: 'et.internal', user: '', sshProfile: 'ssh:office' }).run()
+    await world.create({ host: 'et.internal', user: '', sshProfile: 'ssh:office', reuseSshProfileCredentials: true }).run()
     assert.equal(world.sessions.length, 2)
     for (const session of world.sessions) {
         assert.deepEqual(session.forwardsAtStart, [], `${session.profile.name} set up its port forwards for the bootstrap`)
@@ -497,7 +563,7 @@ test("the port forwards of a linked profile are its own, and not the bootstrap's
 test("the jump host's etterminal is told of its own fifo, and not of the destination's", () => {
     const jump = { credentials: { id: 'RegressionTestId', passkey: 'RegressionTestPasskey00000000000' }, jumpTo: { host: 'dest.internal', port: 2022 } }
     const argv = (options, to) => shellQuote.parse(
-        createBootstrap(options).buildCommand('tester', to).replace(/^echo '[^']*' \| /, ''),
+        createBootstrap(options).buildCommand('tester', to).command,
     ).join(' ')
 
     assert.equal(argv({ serverFifo: '/run/dest.fifo' }), 'etterminal --verbose=0 --serverfifo=/run/dest.fifo')
@@ -509,4 +575,18 @@ test("the jump host's etterminal is told of its own fifo, and not of the destina
         argv({ serverFifo: '/run/dest.fifo', jumpServerFifo: ' /run/jump.fifo ' }, jump),
         'etterminal --verbose=0 --serverfifo=/run/jump.fifo --jump --dsthost=dest.internal --dstport=2022',
     )
+})
+
+test('jump credentials travel over channel stdin, never remote argv', async () => {
+    const world = createTabbyLikeSSH()
+    const credentials = { id: 'RegressionTestId', passkey: 'RegressionTestPasskey00000000000' }
+    const bootstrap = world.create({ jumpHost: 'jump.internal' })
+    await bootstrap.run({ credentials, jumpTo: { host: 'dest.internal', port: 2022 } })
+
+    const session = world.sessions[0]
+    assert.deepEqual(session.inputs, [`${credentials.id}/${credentials.passkey}_xterm-256color\n`])
+    assert.equal(session.eofCount, 1)
+    assert.equal(session.commands.length, 1)
+    assert.doesNotMatch(session.commands[0], /RegressionTestId|RegressionTestPasskey/)
+    assert.match(session.commands[0], /^etterminal /)
 })

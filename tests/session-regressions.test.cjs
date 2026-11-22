@@ -6,7 +6,7 @@ const assert = require('node:assert/strict')
 const { waitFor } = require('./support/load.cjs')
 const { createSessionFixture } = require('./support/sessionFixture.cjs')
 
-const { load, ssh, createInjector, createProfile, startServer } = createSessionFixture()
+const { load, ssh, createInjector, createProfile, startServer, id, passkey } = createSessionFixture()
 const { ETSession } = load('src/session/etSession.ts')
 const { ETPacketType } = load('src/protocol/constants.ts')
 const { decodeTerminalBuffer } = load('src/protocol/messages.ts')
@@ -256,10 +256,10 @@ test('a session destroyed during the reachability probe settles at once', async 
 
 test('a forward with no bind address is not mistaken for a private one', () => {
     const { isLoopbackBindAddress } = load('src/session/tunnelSpec.ts')
-    for (const host of [undefined, null, '', '0.0.0.0', '::', '192.168.1.10']) {
+    for (const host of [undefined, null, '', '0.0.0.0', '::', '192.168.1.10', '127.999.999.999', '127.0.0.256']) {
         assert.equal(isLoopbackBindAddress(host), false)
     }
-    for (const host of ['127.0.0.1', ' localhost ', '[::1]', '127.8.8.8']) {
+    for (const host of ['127.0.0.1', ' localhost ', '[::1]', '127.8.8.8', '127.255.255.255']) {
         assert.equal(isLoopbackBindAddress(host), true)
     }
 })
@@ -352,4 +352,25 @@ test('a tunnel bound to an IPv6 address is not asked of a server that was reache
         await session.destroy()
         await server.close()
     }
+})
+
+test('service logs exclude raw errors and escape and redact the rest', async () => {
+    const session = new ETSession(createInjector(), createProfile(1))
+    session.credentials = { id, passkey }
+    const messages = []
+    session.serviceMessage$.subscribe(message => messages.push(message))
+    const hostile = `Remote failure\n${id}/${passkey}\n\u001b[31msecret`
+
+    session.emitServiceMessage(hostile, { log: false })
+    assert.deepEqual(messages, [hostile], 'the UI lost the server error')
+    assert.deepEqual(session.logger.lines, [], 'a raw server error reached persistent logs')
+
+    session.emitServiceMessage(`notice ${id} ${passkey}\nnext`)
+    const logged = session.logger.lines.join('\n')
+    assert.equal(logged.includes(id), false)
+    assert.equal(logged.includes(passkey), false)
+    assert.equal(logged.includes('\u001b'), false)
+    assert.ok(logged.includes('[redacted]'))
+    assert.ok(logged.includes('\\nnext'), 'a newline was left as a log-line break')
+    await session.destroy()
 })

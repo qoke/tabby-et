@@ -19,7 +19,8 @@ const settle = ms => new Promise(resolve => setTimeout(resolve, ms))
 function createHandler (hooks = {}) {
     const packets = []
     const messages = []
-    const handler = new ETPortForwardHandler(createLogger(), (header, payload, urgent = false) => {
+    const logger = createLogger()
+    const handler = new ETPortForwardHandler(logger, (header, payload, urgent = false) => {
         packets.push({ header, payload })
         hooks.onSend?.(handler, header, payload, urgent)
         return true
@@ -28,7 +29,7 @@ function createHandler (hooks = {}) {
     const sentData = () => packets
         .filter(x => x.header === ETPacketType.PORT_FORWARD_DATA)
         .map(x => decodePortForwardData(x.payload))
-    return { handler, packets, messages, sentData }
+    return { handler, packets, messages, sentData, logger }
 }
 
 /** A local service that keeps its connections open, EOF or not. */
@@ -480,7 +481,48 @@ test('an IPv6 bind address is only asked of a server that is known to have IPv6'
             .map(x => [x.source.name, x.source.port]),
         [['::1', 9000], ['::', 9001], ['127.0.0.1', 9002], ['localhost', 9003]],
     )
-    assert.deepEqual(known.messages, [])
+    // `::` is every IPv6 interface, not loopback: it gets the same warning a
+    // wildcard IPv4 bind does. The other three are private.
+    const warnings = known.messages.filter(x => /reachable from the remote network/.test(x))
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /9001/)
+})
+
+test('a reverse tunnel bound to the network is called out', () => {
+    const { handler, messages } = createHandler()
+    handler.buildReverseTunnelRequests({
+        port: 2022,
+        forwardAgent: false,
+        forwardedPorts: [remote(9000, 80, '0.0.0.0'), remote(9001, 81, '127.0.0.1')],
+    })
+    const warnings = messages.filter(x => /reachable from the remote network/.test(x))
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /9000/)
+    handler.dispose()
+})
+
+test('a local forward bound to the network is called out at runtime', async () => {
+    const { handler, messages } = createHandler()
+    const config = { type: 'Local', host: '0.0.0.0', port: 0, targetAddress: 'localhost', targetPort: 80 }
+    try {
+        await handler.addLocalForward(config)
+        const warnings = messages.filter(x => /reachable from the whole network/.test(x))
+        assert.equal(warnings.length, 1)
+        assert.match(warnings[0], /0\.0\.0\.0/)
+    } finally {
+        handler.removeForward(config)
+        handler.dispose()
+    }
+})
+
+test('a failed destination does not leak the local error to the peer', () => {
+    const { handler, packets, logger } = createHandler()
+    handler.sendDestinationError(42, new Error('connect ECONNREFUSED /secret/path'))
+    const response = decodePortForwardDestinationResponse(packets[0].payload)
+    assert.equal(response.hasError, true)
+    assert.equal(response.error, 'Could not open the destination')
+    assert.ok(logger.lines.some(x => x.includes('/secret/path')))
+    handler.dispose()
 })
 
 test('an attempt on ::1 that goes nowhere is given up for 127.0.0.1', async () => {
@@ -515,5 +557,25 @@ test('an attempt on ::1 that goes nowhere is given up for 127.0.0.1', async () =
         net.Socket.prototype.connect = connect
         handler.dispose()
         await service.close()
+    }
+})
+
+test('a forwarding error reaches the UI but not persistent logs', () => {
+    const logger = createLogger()
+    const messages = []
+    const handler = new ETPortForwardHandler(logger, () => true, (message, options) => messages.push({ message, options }))
+    const socket = new net.Socket()
+    const hostile = 'refused\nRegressionTestId/RegressionTestPasskey00000000000\n\u001b[31msecret'
+    try {
+        handler.onLocalConnection({ targetAddress: 'localhost', targetPort: 80 }, socket)
+        handler.onDestinationResponse(encodePortForwardDestinationResponse({ clientFd: 1, hasError: true, error: hostile }))
+        assert.equal(messages.length, 1)
+        assert.ok(messages[0].message.includes(hostile))
+        assert.deepEqual(messages[0].options, { log: false })
+        assert.equal(logger.lines.some(line => line.includes('Remote refused a forwarded connection')), true)
+        assert.equal(logger.lines.some(line => /RegressionTest|secret|\u001b/.test(line)), false)
+    } finally {
+        socket.destroy()
+        handler.dispose()
     }
 })

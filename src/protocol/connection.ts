@@ -499,7 +499,9 @@ export class ETClientConnection {
         await this.writeProto(socket, encodeConnectRequest(this.options.id, PROTOCOL_VERSION))
         const response = decodeConnectResponse(await this.readProto(reader, MAX_HANDSHAKE_PROTO_LENGTH))
         if (response.error) {
-            this.logger.info(`etserver said: ${response.error}`)
+            // Cleartext handshake errors are attacker-controlled. Do not copy
+            // their control characters, credentials, or terminal data into logs.
+            this.logger.info('etserver returned an error during the connection handshake')
         }
         return response.status ?? 0
     }

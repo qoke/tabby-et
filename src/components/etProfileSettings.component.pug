@@ -41,6 +41,12 @@ ul.nav-tabs(ngbNav, #nav='ngbNav')
                     [(ngModel)]='profile.options.sshPort',
                 )
 
+            .form-line(*ngIf='profile.options.sshProfile || profile.options.jumpSshProfile')
+                .header
+                    .title(translate) Reuse SSH profile credentials for a different host
+                    .description(translate) Allow the linked SSH profile's saved password and keys to authenticate to an ET host other than that profile's own host. Only enable this for hosts you trust.
+                toggle([(ngModel)]='profile.options.reuseSshProfileCredentials')
+
     li(ngbNavItem)
         a(ngbNavLink, translate) Ports
         ng-template(ngbNavContent)

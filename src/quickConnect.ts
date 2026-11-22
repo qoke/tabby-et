@@ -53,13 +53,23 @@ function readCommandLine (words: string[]): { destination: string, port?: string
 }
 
 /**
+ * A password in `user:password@host` userinfo is not part of a username. Drop
+ * it rather than passing it to the SSH server or keeping it in a profile name.
+ */
+function stripPassword (user: string): string {
+    const colon = user.indexOf(':')
+    return colon >= 0 ? user.slice(0, colon) : user
+}
+
+/**
  * Pure parser behind ETProfilesService.quickConnect.
  *
  * Accepts "user@host", "user@host:2022" and "user@[::1]:2022", an address
  * that starts with "et://", and an `et` command line, so that one can be
  * pasted. Never throws and always produces a port in 1-65535: a port that
  * cannot be read, or that is out of range, is the default, and unbalanced
- * brackets degrade to a best-effort host.
+ * brackets degrade to a best-effort host. A password in userinfo is discarded;
+ * only the username is kept.
  */
 export function parseQuickConnectQuery (query: string): ETQuickConnectTarget {
     let raw = query.trim()
@@ -78,7 +88,7 @@ export function parseQuickConnectQuery (query: string): ETQuickConnectTarget {
     if (raw.includes('@')) {
         const parts = raw.split(/@/g)
         raw = parts[parts.length - 1]
-        user = parts.slice(0, parts.length - 1).join('@')
+        user = stripPassword(parts.slice(0, parts.length - 1).join('@'))
     }
     if (raw.includes('[')) {
         // Bracketed IPv6, optionally ":port" after the ']'. The ']' may be
@@ -99,5 +109,8 @@ export function parseQuickConnectQuery (query: string): ETQuickConnectTarget {
     if (said.port !== undefined) {
         port = parsePortOrDefault(said.port)
     }
-    return { host: said.host || raw, user: said.user || user, port }
+    if (said.user) {
+        user = stripPassword(said.user)
+    }
+    return { host: said.host || raw, user, port }
 }
