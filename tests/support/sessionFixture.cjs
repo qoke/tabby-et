@@ -57,7 +57,7 @@ function createSessionFixture () {
     }
 
     const load = createLoader({
-        'tabby-ssh': { PortForwardType: { Local: 'Local', Remote: 'Remote' }, SSHSession },
+        'tabby-ssh': { PortForwardType: { Local: 'Local', Remote: 'Remote' }, SSHSession, KeyboardInteractivePrompt: class KeyboardInteractivePrompt {} },
     })
     const core = load.modules['tabby-core']
     const FakeEtServer = createFakeEtServer(load)

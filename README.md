@@ -29,12 +29,21 @@ Key design decisions:
 
 ## Compatibility
 
-This plugin requires Tabby with the small SSH API changes in PR#11649.
-That PR/branch exports `SSHSession` and its keyboard interactive
-prompt, makes the prompt component available to plugins, and adds
-`SSHSession.openExecChannel()`. A stock Tabby release will not load
-the plugin correctly until those changes are accepted and released
-upstream.      
+This plugin needs a Tabby with the small SSH API changes in
+[Tabby PR #11649](https://github.com/Eugeny/tabby/pull/11649). The PR
+exports `SSHSession` and its keyboard-interactive prompt, makes the
+prompt component available to plugins, and adds
+`SSHSession.openExecChannel()`: 17 added lines in two files. Released
+Tabby does not have them yet.
+
+The plugin checks for them each time Tabby starts. On a Tabby without
+them it still installs, but it says so when Tabby starts, in
+**Settings → Eternal Terminal**, and in any Eternal Terminal tab, and
+it does not try to connect.
+[Getting a Tabby that can run Eternal Terminal](docs/tabby-support.md)
+takes you through building one, step by step, and shows how to check
+the change yourself first. Once a Tabby release includes the change,
+update Tabby and the warning goes away.
 
 The ET server host must have `etserver` and `etterminal` installed. The plugin uses Tabby's SSH connection to start `etterminal`; it does not invoke a local ET binary.
 
@@ -49,9 +58,9 @@ connection type.
 You need a Tabby build with the SSH API changes described under
 [Compatibility](#compatibility), for example one built from the
 [`tabby-et-ssh-support`](https://github.com/qoke/tabby/tree/tabby-et-ssh-support)
-branch of `qoke/tabby`. A stock Tabby release will install the plugin
-but will not load it correctly. This requirement goes away once those
-changes are released in mainstream Tabby.
+branch of `qoke/tabby`. [The setup guide](docs/tabby-support.md) shows
+how. A released Tabby installs the plugin, but the plugin cannot open
+connections there and says so.
 
 ### From inside Tabby
 

@@ -11,6 +11,7 @@ import { ETProfile } from '../api/interfaces'
 import { ETSession, ETSessionDestroyedError } from '../session/etSession'
 import { ETConnectionState } from '../protocol/connection'
 import { ETPortForwardingModalComponent } from './etPortForwardingModal.component'
+import { tabbySupport, unsupportedTabbyTerminalText } from '../tabbySupport'
 
 /**
  * From when on a request for a new session, made while one is being set up,
@@ -146,6 +147,16 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
     async initializeSession (): Promise<void> {
         await super.initializeSession()
         if (this.closed) {
+            return
+        }
+
+        // A Tabby without the SSH changes would get as far as the bootstrap and
+        // fail there with "SSHSession is not a constructor". Say what is wrong
+        // instead, in the tab, before anything is sent anywhere.
+        const support = tabbySupport()
+        if (!support.supported) {
+            this.notifications.error('This Tabby cannot open Eternal Terminal connections yet. The tab says how to fix it.', this.etNotificationTitle)
+            void this.write(unsupportedTabbyTerminalText(support)).catch(() => undefined)
             return
         }
 

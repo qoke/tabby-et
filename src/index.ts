@@ -2,8 +2,8 @@ import { NgModule } from '@angular/core'
 import { CommonModule } from '@angular/common'
 import { FormsModule } from '@angular/forms'
 import { NgbModule } from '@ng-bootstrap/ng-bootstrap'
-import { ToastrModule } from 'ngx-toastr'
-import TabbyCoreModule, { ConfigProvider, HotkeyProvider, ProfileProvider, TabRecoveryProvider } from 'tabby-core'
+import { ToastrModule, ToastrService } from 'ngx-toastr'
+import TabbyCoreModule, { AppService, ConfigProvider, HotkeyProvider, LogService, PlatformService, ProfileProvider, TabRecoveryProvider } from 'tabby-core'
 import { SettingsTabProvider } from 'tabby-settings'
 import TabbyTerminalModule from 'tabby-terminal'
 import TabbySSHModule from 'tabby-ssh'
@@ -13,12 +13,14 @@ import { ETProfileSettingsComponent } from './components/etProfileSettings.compo
 import { ETPortForwardingConfigComponent } from './components/etPortForwardingConfig.component'
 import { ETPortForwardingModalComponent } from './components/etPortForwardingModal.component'
 import { ETSettingsTabComponent } from './components/etSettingsTab.component'
+import { ETTabbySupportNoticeComponent } from './components/etTabbySupportNotice.component'
 
 import { ETConfigProvider } from './config'
 import { ETHotkeyProvider } from './hotkeys'
 import { ETProfilesService } from './profiles'
 import { ETSettingsTabProvider } from './settings'
 import { RecoveryProvider } from './recoveryProvider'
+import { TABBY_SUPPORT_GUIDE_URL, tabbySupport } from './tabbySupport'
 
 /** @hidden */
 @NgModule({
@@ -46,10 +48,31 @@ import { RecoveryProvider } from './recoveryProvider'
         ETPortForwardingConfigComponent,
         ETPortForwardingModalComponent,
         ETSettingsTabComponent,
+        ETTabbySupportNoticeComponent,
     ],
 })
 // eslint-disable-next-line @typescript-eslint/no-extraneous-class
-export default class ETModule { }
+export default class ETModule {
+    constructor (app: AppService, toastr: ToastrService, platform: PlatformService, log: LogService) {
+        // A Tabby without the SSH changes loads the plugin and fails only when
+        // a connection starts. Say so once, as Tabby starts, rather than leave
+        // the first connection to find out.
+        const support = tabbySupport()
+        if (support.supported) {
+            return
+        }
+        log.create('et').warn(`This Tabby cannot open Eternal Terminal connections: ${support.missing.join('; ')}. See ${TABBY_SUPPORT_GUIDE_URL}`)
+        app.ready$.subscribe(() => {
+            toastr.warning(
+                'This Tabby cannot open Eternal Terminal connections yet. Click here for the setup guide, or see Settings → Eternal Terminal.',
+                'Eternal Terminal',
+                { timeOut: 30000, extendedTimeOut: 10000 },
+            ).onTap.subscribe(() => {
+                void platform.openExternal(TABBY_SUPPORT_GUIDE_URL)
+            })
+        })
+    }
+}
 
 export * from './api/interfaces'
 export { ETSession } from './session/etSession'

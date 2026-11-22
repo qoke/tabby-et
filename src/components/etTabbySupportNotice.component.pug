@@ -1,0 +1,13 @@
+.alert.alert-warning.mb-3(*ngIf='!support.supported', role='alert')
+    h5.alert-heading(translate) This Tabby cannot open Eternal Terminal connections yet
+    p(translate) The Eternal Terminal plugin needs a small addition to Tabby's SSH plugin. It lets other plugins use Tabby's SSH connection to start one command on the server. The addition is in a Tabby pull request that has not been released, so Tabby from tabby.sh or an app store does not have it.
+    p(translate) Until it is released, run a Tabby built from source with that change. The setup guide takes you through it step by step and shows the change line by line, so you can check it before you build.
+    details.mb-3
+        summary(translate) What this Tabby is missing
+        ul.mb-0.mt-2
+            li(*ngFor='let item of support.missing') {{ item }}
+    .d-flex.flex-wrap.gap-2
+        button.btn.btn-warning((click)='openGuide()')
+            span(translate) Open the setup guide
+        button.btn.btn-secondary((click)='openPullRequest()')
+            span(translate) View the Tabby pull request
